@@ -1,0 +1,23 @@
+@'
+# Python 虚拟环境
+venv/
+.env/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# 日志
+*.log
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+'@ | Set-Content .gitignore -Encoding UTF8
