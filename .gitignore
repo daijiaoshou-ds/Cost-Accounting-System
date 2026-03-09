@@ -22,5 +22,3 @@ __pycache__/
 Thumbs.db
 '@ | Set-Content .gitignore -Encoding UTF8
 
-# streamlit
-.streamlit
