@@ -1,4 +1,3 @@
-@'
 # Python 虚拟环境
 venv/
 .env/
@@ -20,5 +19,6 @@ __pycache__/
 # 操作系统文件
 .DS_Store
 Thumbs.db
-'@ | Set-Content .gitignore -Encoding UTF8
 
+# 项目特定
+AGENTS.md
