@@ -347,6 +347,7 @@ class CostCalculator:
                     W[node_index[p], node_index[order]] = 1.0
         
         # 物料→工单（消耗）
+        zero_availability_warnings = []
         for _, row in self.io_df.iterrows():
             order = str(row['工单号'])
             material = str(row['材料编码'])
@@ -360,22 +361,67 @@ class CostCalculator:
                 ratio = issue / avail
                 if ratio > 1:
                     ratio = 1.0
+            elif issue > 0:
+                # 可供发出数量为0但材料被领用，这是一个数据问题
+                # 强制设置为1，表示这个工单消耗了该材料的所有"虚拟"库存
+                ratio = 1.0
+                if material not in zero_availability_warnings:
+                    zero_availability_warnings.append(material)
             else:
                 ratio = 0
             
             W[node_index[order], node_index[material]] = ratio
+        
+        # 记录数据问题
+        if zero_availability_warnings:
+            self.performance_log['数据警告'] = f"以下物料无可用库存但被领用: {', '.join(zero_availability_warnings[:5])}"
         
         self.performance_log['构建矩阵'] = time.time() - t0
         
         # Step 4: 计算逆矩阵 (I-W)⁻¹
         t0 = time.time()
         I = np.eye(n)
+        A = I - W
+        
+        # 检查矩阵是否接近奇异
         try:
-            inv_matrix = np.linalg.inv(I - W)
-        except np.linalg.LinAlgError as e:
-            raise ValueError(f"矩阵求逆失败：{e}")
+            cond = np.linalg.cond(A)
+        except:
+            cond = float('inf')
+        
+        # 尝试多种方法求逆
+        inv_matrix = None
+        method_used = "直接求逆"
+        
+        # 方法1: 直接求逆
+        try:
+            if cond < 1e12:  # 条件数不太大时尝试直接求逆
+                inv_matrix = np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            pass
+        
+        # 方法2: 添加正则化（如果直接求逆失败或条件数太大）
+        if inv_matrix is None:
+            try:
+                # 添加小的正则化项，使矩阵可逆
+                epsilon = 1e-10
+                A_reg = A + epsilon * np.eye(n)
+                inv_matrix = np.linalg.inv(A_reg)
+                method_used = f"正则化求逆(ε={epsilon})"
+            except np.linalg.LinAlgError:
+                pass
+        
+        # 方法3: 使用伪逆（如果上述方法都失败）
+        if inv_matrix is None:
+            try:
+                inv_matrix = np.linalg.pinv(A)
+                method_used = "伪逆(Moore-Penrose)"
+            except Exception as e:
+                raise ValueError(f"矩阵求逆失败，已尝试所有方法：{e}")
         
         self.performance_log['矩阵求逆'] = time.time() - t0
+        self.performance_log['矩阵条件数'] = cond
+        self.performance_log['求逆方法'] = method_used
         
         # Step 5: 识别原材料和最终成品
         # 原材料：没有被作为产品生产的材料（只有采购，没有生产入库）
