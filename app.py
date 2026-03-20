@@ -115,16 +115,22 @@ with st.sidebar:
     uploaded = {}
     mappings = {}
     
+    # 必须上传的文件
+    required_files = ['purchase', 'io']
+    # 可选上传的文件
+    optional_files = ['initial', 'labor']
+    
     file_configs = [
-        ('initial', '期初结存', '期初'),
-        ('purchase', '采购入库', '采购'),
-        ('io', '投入产出明细', '投入产出'),
-        ('labor', '工单人工制费', '工单费用')
+        ('purchase', '采购入库', '采购', True),  # True = 必须
+        ('io', '投入产出明细', '投入产出', True),
+        ('initial', '期初结存', '期初', False),  # False = 可选
+        ('labor', '工单人工制费', '工单费用', False)
     ]
     
-    for key, title, ptype in file_configs:
-        with st.expander(f"{title}", expanded=(key=='initial')):
-            f = st.file_uploader(f"上传{title}", type=['xlsx', 'xls'], key=key)
+    for key, title, ptype, is_required in file_configs:
+        with st.expander(f"{'*' if is_required else ' '}{title}", expanded=(key=='purchase')):
+            help_text = f"{'【必须上传】' if is_required else '【可选上传】'}上传{title}"
+            f = st.file_uploader(help_text, type=['xlsx', 'xls'], key=key)
             if f:
                 try:
                     df = pd.read_excel(f)
@@ -155,11 +161,22 @@ with st.sidebar:
                     uploaded[key] = f
                 except Exception as e:
                     st.error(f"读取失败: {e}")
+            elif is_required:
+                st.info(f"⚠️ 请上传 {title} 文件")
 
 # 主界面
-ready = len(uploaded) == 4
+# 只需要采购入库和投入产出明细
+ready = 'purchase' in uploaded and 'io' in uploaded
 
-if st.button("🚀 执行成本计算", type="primary", disabled=not ready, use_container_width=True):
+# 添加计算模式选择
+calc_mode = st.radio(
+    "计算模式",
+    ["成本核算", "材料穿透追溯"],
+    index=0,
+    help="成本核算：计算料工费成本；材料穿透追溯：追踪原材料到最终成品的传递路径"
+)
+
+if st.button(f"🚀 执行{calc_mode}", type="primary", disabled=not ready, use_container_width=True):
     if ready:
         with st.spinner("计算中..."):
             try:
@@ -168,19 +185,29 @@ if st.button("🚀 执行成本计算", type="primary", disabled=not ready, use_
                 # 记录总时间
                 start = time.time()
                 
+                # 加载数据（期初和人工制费为可选）
                 calc.load_data(
-                    uploaded['initial'], uploaded['purchase'], 
-                    uploaded['io'], uploaded['labor'],
-                    mappings['initial'], mappings['purchase'],
-                    mappings['io'], mappings['labor']
+                    uploaded.get('initial'), 
+                    uploaded['purchase'], 
+                    uploaded['io'], 
+                    uploaded.get('labor'),
+                    mappings.get('initial', {}), 
+                    mappings.get('purchase', {}),
+                    mappings.get('io', {}), 
+                    mappings.get('labor', {})
                 )
                 
-                result = calc.calculate()
+                if calc_mode == "成本核算":
+                    result = calc.calculate()
+                else:
+                    result = calc.calculate_material_trace()
+                
                 total_time = time.time() - start
                 
                 st.session_state.result = result
                 st.session_state.perf = calc.get_performance()
                 st.session_state.total_time = total_time
+                st.session_state.calc_mode = calc_mode
                 
                 st.success(f"✅ 计算完成！总用时: {total_time:.3f}秒")
                 
@@ -217,35 +244,71 @@ if st.session_state.perf:
 # 显示结果
 if st.session_state.result:
     result = st.session_state.result
+    calc_mode = st.session_state.get('calc_mode', '成本核算')
     
-    st.subheader("📊 计算结果")
+    st.subheader(f"📊 {calc_mode}结果")
     
-    # 指标卡
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        total = result['收发存']['总成本'].sum()
-        st.metric("总成本", f"¥{total:,.2f}")
-    with c2:
-        max_val = result['收发存']['总成本'].max()
-        st.metric("最大单项", f"¥{max_val:,.2f}")
-    with c3:
-        count = len(result['收发存'])
-        st.metric("物料数量", count)
-    
-    # 标签页
-    tab1, tab2 = st.tabs(["📋 收发存汇总", "📈 成本明细"])
-    
-    with tab1:
-        st.dataframe(result['收发存'].sort_values('总成本', ascending=False), 
-                    use_container_width=True, height=400)
+    if calc_mode == "成本核算":
+        # 指标卡
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            total = result['收发存']['总成本'].sum()
+            st.metric("总成本", f"¥{total:,.2f}")
+        with c2:
+            max_val = result['收发存']['总成本'].max()
+            st.metric("最大单项", f"¥{max_val:,.2f}")
+        with c3:
+            count = len(result['收发存'])
+            st.metric("物料数量", count)
         
-        # 下载
-        excel = to_excel({
-            '收发存汇总': result['收发存'],
-            '成本明细': result['明细']
-        })
-        st.download_button("📥 下载Excel", excel, "成本核算结果.xlsx")
+        # 标签页
+        tab1, tab2 = st.tabs(["📋 收发存汇总", "📈 成本明细"])
+        
+        with tab1:
+            st.dataframe(result['收发存'].sort_values('总成本', ascending=False), 
+                        use_container_width=True, height=400)
+            
+            # 下载
+            excel = to_excel({
+                '收发存汇总': result['收发存'],
+                '成本明细': result['明细']
+            })
+            st.download_button("📥 下载Excel", excel, "成本核算结果.xlsx")
+        
+        with tab2:
+            st.dataframe(result['明细'].sort_values('总成本', ascending=False),
+                        use_container_width=True, height=400)
     
-    with tab2:
-        st.dataframe(result['明细'].sort_values('总成本', ascending=False),
-                    use_container_width=True, height=400)
+    else:  # 材料穿透追溯模式
+        # 指标卡
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            trace_count = len(result['材料传递路径'])
+            st.metric("传递路径数", trace_count)
+        with c2:
+            raw_materials = result['材料传递路径']['原材料编码'].nunique()
+            st.metric("原材料种类", raw_materials)
+        with c3:
+            end_products = result['材料传递路径']['最终成品编码'].nunique()
+            st.metric("最终成品种类", end_products)
+        
+        # 标签页
+        tab1, tab2 = st.tabs(["📋 材料传递路径", "📈 路径明细"])
+        
+        with tab1:
+            st.dataframe(result['材料传递路径'].sort_values(['原材料编码', '层级']), 
+                        use_container_width=True, height=400)
+            
+            # 下载
+            excel = to_excel({
+                '材料传递路径': result['材料传递路径'],
+                '路径明细': result['路径明细'] if '路径明细' in result else result['材料传递路径']
+            })
+            st.download_button("📥 下载Excel", excel, "材料穿透追溯结果.xlsx")
+        
+        with tab2:
+            if '路径明细' in result:
+                st.dataframe(result['路径明细'],
+                            use_container_width=True, height=400)
+            else:
+                st.info("暂无详细路径数据")

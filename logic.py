@@ -16,24 +16,28 @@ class CostCalculator:
         
     def load_data(self, initial_file, purchase_file, io_file, labor_file,
                   initial_map, purchase_map, io_map, labor_map):
-        """加载并清洗数据"""
+        """加载并清洗数据（期初和人工制费为可选）"""
         start_time = time.time()
         
-        # 期初
-        df_init = pd.read_excel(initial_file)
-        df_init = df_init.rename(columns=initial_map)
-        df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
-        df_init['期初金额'] = pd.to_numeric(df_init['期初金额'], errors='coerce').fillna(0)
-        if '期初数量' in df_init.columns:
-            df_init['期初数量'] = pd.to_numeric(df_init['期初数量'], errors='coerce').fillna(0)
+        # 期初（可选）
+        if initial_file is not None and initial_map:
+            df_init = pd.read_excel(initial_file)
+            df_init = df_init.rename(columns=initial_map)
+            df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
+            df_init['期初金额'] = pd.to_numeric(df_init['期初金额'], errors='coerce').fillna(0)
+            if '期初数量' in df_init.columns:
+                df_init['期初数量'] = pd.to_numeric(df_init['期初数量'], errors='coerce').fillna(0)
+            else:
+                df_init['期初数量'] = 0
+            self.initial_df = df_init.groupby('物料编码').agg({
+                '期初金额': 'sum',
+                '期初数量': 'sum'
+            }).reset_index()
         else:
-            df_init['期初数量'] = 0
-        self.initial_df = df_init.groupby('物料编码').agg({
-            '期初金额': 'sum',
-            '期初数量': 'sum'
-        }).reset_index()
+            # 创建空的期初数据框
+            self.initial_df = pd.DataFrame(columns=['物料编码', '期初金额', '期初数量'])
         
-        # 采购
+        # 采购（必须）
         df_pur = pd.read_excel(purchase_file)
         df_pur = df_pur.rename(columns=purchase_map)
         df_pur['物料编码'] = df_pur['物料编码'].astype(str).str.strip()
@@ -44,7 +48,7 @@ class CostCalculator:
             '采购金额': 'sum'
         }).reset_index()
         
-        # 投入产出
+        # 投入产出（必须）
         df_io = pd.read_excel(io_file)
         df_io = df_io.rename(columns=io_map)
         df_io['工单号'] = df_io['工单号'].astype(str).str.strip()
@@ -59,13 +63,17 @@ class CostCalculator:
         }).reset_index()
         self.io_df = df_io_clean
         
-        # 工单费用
-        df_lab = pd.read_excel(labor_file)
-        df_lab = df_lab.rename(columns=labor_map)
-        df_lab['工单号'] = df_lab['工单号'].astype(str).str.strip()
-        df_lab['人工'] = pd.to_numeric(df_lab['人工'], errors='coerce').fillna(0)
-        df_lab['制费'] = pd.to_numeric(df_lab['制费'], errors='coerce').fillna(0)
-        self.labor_df = df_lab.groupby('工单号')[['人工', '制费']].sum().reset_index()
+        # 工单费用（可选）
+        if labor_file is not None and labor_map:
+            df_lab = pd.read_excel(labor_file)
+            df_lab = df_lab.rename(columns=labor_map)
+            df_lab['工单号'] = df_lab['工单号'].astype(str).str.strip()
+            df_lab['人工'] = pd.to_numeric(df_lab['人工'], errors='coerce').fillna(0)
+            df_lab['制费'] = pd.to_numeric(df_lab['制费'], errors='coerce').fillna(0)
+            self.labor_df = df_lab.groupby('工单号')[['人工', '制费']].sum().reset_index()
+        else:
+            # 创建空的人工制费数据框
+            self.labor_df = pd.DataFrame(columns=['工单号', '人工', '制费'])
         
         self.performance_log['数据清洗'] = time.time() - start_time
         return True
@@ -259,6 +267,246 @@ class CostCalculator:
         
         return self.result
     
+    def calculate_material_trace(self):
+        """计算材料传递路径（原材料 → 最终成品）"""
+        total_start = time.time()
+        
+        # Step 1: 构建节点
+        t0 = time.time()
+        products = set(self.io_df['产品编码'].unique())
+        materials = set(self.io_df['材料编码'].unique())
+        
+        all_materials = products | materials
+        all_orders = set(self.io_df['工单号'].unique())
+        
+        material_nodes = sorted(list(all_materials))
+        order_nodes = sorted(list(all_orders))
+        all_nodes = material_nodes + order_nodes
+        n = len(all_nodes)
+        
+        node_index = {node: i for i, node in enumerate(all_nodes)}
+        index_node = {i: node for i, node in enumerate(all_nodes)}
+        self.performance_log['构建节点'] = time.time() - t0
+        
+        # Step 2: 计算可供发出数量
+        t0 = time.time()
+        available_qty = {}
+        
+        for mat in material_nodes:
+            available_qty[mat] = {'采购': 0, '生产': 0, '合计': 0}
+        
+        # 采购数量
+        for _, row in self.purchase_df.iterrows():
+            mat = str(row['物料编码'])
+            if mat in available_qty:
+                available_qty[mat]['采购'] = row['采购数量']
+        
+        # 生产入库数量
+        production_summary = self.io_df.groupby('产品编码')['产品完工数量'].first().reset_index()
+        for _, row in production_summary.iterrows():
+            mat = str(row['产品编码'])
+            if mat in available_qty:
+                available_qty[mat]['生产'] = row['产品完工数量']
+        
+        for mat in available_qty:
+            available_qty[mat]['合计'] = available_qty[mat]['采购'] + available_qty[mat]['生产']
+        
+        self.performance_log['计算数量'] = time.time() - t0
+        
+        # Step 3: 构建W矩阵
+        t0 = time.time()
+        W = np.zeros((n, n))
+        
+        # 工单→物料（产出）- 只要工单只产出一种物料，产出关系就是100%
+        order_products = self.io_df.groupby('工单号')['产品编码'].apply(list).reset_index()
+        for _, row in order_products.iterrows():
+            order = str(row['工单号'])
+            if order not in node_index:
+                continue
+            
+            prods = row['产品编码']
+            # 该工单所有产品的完工数量
+            qty_map = {}
+            for p in prods:
+                p = str(p)
+                q = self.io_df[(self.io_df['工单号']==order) & (self.io_df['产品编码']==p)]['产品完工数量'].iloc[0]
+                qty_map[p] = q
+            
+            # 产出比例 = 该产品数量 / 该工单该产品数量（实际上相同，所以是1.0）
+            for p, q in qty_map.items():
+                if p in node_index:
+                    # 只要工单产出这个产品，比例就是1.0
+                    W[node_index[p], node_index[order]] = 1.0
+        
+        # 物料→工单（消耗）
+        for _, row in self.io_df.iterrows():
+            order = str(row['工单号'])
+            material = str(row['材料编码'])
+            issue = row['材料领用数量']
+            
+            if material not in node_index or order not in node_index:
+                continue
+            
+            avail = available_qty.get(material, {}).get('合计', 0)
+            if avail > 0:
+                ratio = issue / avail
+                if ratio > 1:
+                    ratio = 1.0
+            else:
+                ratio = 0
+            
+            W[node_index[order], node_index[material]] = ratio
+        
+        self.performance_log['构建矩阵'] = time.time() - t0
+        
+        # Step 4: 计算逆矩阵 (I-W)⁻¹
+        t0 = time.time()
+        I = np.eye(n)
+        try:
+            inv_matrix = np.linalg.inv(I - W)
+        except np.linalg.LinAlgError as e:
+            raise ValueError(f"矩阵求逆失败：{e}")
+        
+        self.performance_log['矩阵求逆'] = time.time() - t0
+        
+        # Step 5: 识别原材料和最终成品
+        # 原材料：没有被作为产品生产的材料（只有采购，没有生产入库）
+        # 最终成品：没有被领用的产品
+        
+        # 被作为产品生产的材料
+        produced_materials = set(self.io_df['产品编码'].unique())
+        # 被领用的材料
+        consumed_materials = set(self.io_df['材料编码'].unique())
+        
+        # 原材料 = 被领用的材料 - 被生产出来的材料（纯采购材料）
+        raw_materials = consumed_materials - produced_materials
+        # 最终成品 = 被生产出来的材料 - 被领用的材料
+        end_products = produced_materials - consumed_materials
+        
+        self.performance_log['识别节点'] = time.time() - t0
+        
+        # Step 6: 计算传递路径和数量关系
+        t0 = time.time()
+        trace_list = []
+        
+        # 用于追踪路径的辅助函数
+        def find_path_dfs(start_idx, end_idx, visited=None):
+            """使用DFS查找从start到end的所有路径"""
+            if visited is None:
+                visited = set()
+            
+            if start_idx == end_idx:
+                return [[]]
+            
+            if start_idx in visited:
+                return []
+            
+            visited.add(start_idx)
+            paths = []
+            
+            # 从start可以到达的下一个节点
+            for next_idx in range(n):
+                if W[next_idx, start_idx] > 0 and next_idx not in visited:
+                    sub_paths = find_path_dfs(next_idx, end_idx, visited.copy())
+                    for sub_path in sub_paths:
+                        paths.append([next_idx] + sub_path)
+            
+            return paths
+        
+        def build_path_string(path_indices):
+            """将路径索引转换为可读的字符串"""
+            if not path_indices:
+                return "直接领用"
+            
+            path_nodes = [index_node[idx] for idx in path_indices]
+            # 路径：工单 → 产品 → 工单 → 产品...
+            return " → ".join(path_nodes)
+        
+        def calculate_level(path_indices):
+            """计算传递层级（经过的半成品层数）"""
+            if not path_indices:
+                return 1
+            # 统计经过的产品节点数
+            product_count = sum(1 for idx in path_indices if index_node[idx] in produced_materials)
+            return product_count + 1
+        
+        # 对每个原材料-最终成品组合
+        for raw_mat in raw_materials:
+            if raw_mat not in node_index:
+                continue
+            raw_idx = node_index[raw_mat]
+            
+            for end_prod in end_products:
+                if end_prod not in node_index:
+                    continue
+                end_idx = node_index[end_prod]
+                
+                # 获取传递系数
+                coefficient = inv_matrix[end_idx, raw_idx]
+                
+                if coefficient > 1e-10:  # 只保留有效的传递
+                    # 查找所有路径
+                    paths = find_path_dfs(raw_idx, end_idx)
+                    
+                    for path in paths:
+                        path_str = build_path_string(path)
+                        level = calculate_level(path)
+                        
+                        # 计算单位成品耗用原材料数量
+                        # 使用逆矩阵元素作为系数
+                        unit_consumption = coefficient
+                        
+                        trace_list.append({
+                            '原材料编码': raw_mat,
+                            '最终成品编码': end_prod,
+                            '传递路径': path_str,
+                            '层级': level,
+                            '单位成品耗用原材料数量': unit_consumption
+                        })
+        
+        self.performance_log['计算路径'] = time.time() - t0
+        self.performance_log['总计算时间'] = time.time() - total_start
+        
+        # 创建结果DataFrame
+        trace_df = pd.DataFrame(trace_list)
+        
+        # 如果没有找到路径，返回空DataFrame
+        if trace_df.empty:
+            trace_df = pd.DataFrame(columns=['原材料编码', '最终成品编码', '传递路径', '层级', '单位成品耗用原材料数量'])
+        
+        # 生成路径明细（用于调试或详细查看）
+        detail_list = []
+        for i, node in enumerate(all_nodes):
+            node_type = '物料'
+            if node in order_nodes:
+                node_type = '工单'
+            elif node in raw_materials:
+                node_type = '原材料'
+            elif node in end_products:
+                node_type = '最终成品'
+            elif node in produced_materials:
+                node_type = '半成品'
+            
+            detail_list.append({
+                '节点': node,
+                '类型': node_type,
+                '节点索引': i
+            })
+        
+        detail_df = pd.DataFrame(detail_list)
+        
+        self.result = {
+            '材料传递路径': trace_df,
+            '路径明细': detail_df,
+            'nodes': all_nodes,
+            'raw_materials': list(raw_materials),
+            'end_products': list(end_products),
+            'W_matrix': W,
+            'inv_matrix': inv_matrix
+        }
+        
+        return self.result
+
     def get_performance(self):
         return self.performance_log
 
