@@ -19,8 +19,12 @@ class CostCalculator:
         """加载并清洗数据（期初和人工制费为可选）"""
         start_time = time.time()
         
-        # 期初（可选）
-        if initial_file is not None and initial_map:
+        # 期初（可选）- 确保文件对象有效
+        has_initial = (initial_file is not None and 
+                      hasattr(initial_file, 'read') and 
+                      initial_map and 
+                      len(initial_map) > 0)
+        if has_initial:
             df_init = pd.read_excel(initial_file)
             df_init = df_init.rename(columns=initial_map)
             df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
@@ -63,8 +67,12 @@ class CostCalculator:
         }).reset_index()
         self.io_df = df_io_clean
         
-        # 工单费用（可选）
-        if labor_file is not None and labor_map:
+        # 工单费用（可选）- 确保文件对象有效
+        has_labor = (labor_file is not None and 
+                    hasattr(labor_file, 'read') and 
+                    labor_map and 
+                    len(labor_map) > 0)
+        if has_labor:
             df_lab = pd.read_excel(labor_file)
             df_lab = df_lab.rename(columns=labor_map)
             df_lab['工单号'] = df_lab['工单号'].astype(str).str.strip()
