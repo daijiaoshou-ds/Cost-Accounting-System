@@ -14,11 +14,16 @@ __pycache__/
 *.iml
 
 # 日志
-*.log
+log
 
 # 操作系统文件
 .DS_Store
 Thumbs.db
 
+# Streamlit 生成的静态资源
+lib/
+
 # 项目特定
 AGENTS.md
+theory.md
+start.bat
