@@ -292,98 +292,495 @@ def render_time_metrics(perf, total_time):
         </div>
         """, unsafe_allow_html=True)
 
-def create_network_graph(calc):
-    """创建材料穿透网络图"""
+def create_sankey_graph(calc, result=None):
+    """
+    材料成本流向可视化 - 双视图
+    返回两个函数：聚合视图函数、穿透视图函数
+    """
+    import plotly.graph_objects as go
+    from collections import deque, defaultdict
+    import json
+    
     try:
-        from pyvis.network import Network
-        import tempfile
-        import os
-        
-        # 获取计算结果中的必要数据
         if not hasattr(calc, 'W_matrix') or calc.W_matrix is None:
             st.warning("未找到流转矩阵数据")
+            return None, None
+        
+        W = calc.W_matrix
+        all_nodes = calc.all_nodes
+        material_nodes = calc.material_nodes
+        order_nodes = calc.order_nodes
+        n = len(all_nodes)
+        
+        # 颜色配置
+        TYPE_FILL = {
+            '物料_L0': '#B5D4F4',
+            '工单':    '#FAC775',
+            '物料_L2': '#9FE1CB',
+            '物料_L4': '#CECBF6',
+            '物料_L6': '#F5C4B3',
+            '物料':    '#D3D1C7',
+        }
+        TYPE_STROKE = {
+            '物料_L0': '#378ADD',
+            '工单':    '#BA7517',
+            '物料_L2': '#1D9E75',
+            '物料_L4': '#7F77DD',
+            '物料_L6': '#D85A30',
+            '物料':    '#888780',
+        }
+        
+        # 成本数据
+        cost_data = {}
+        if result and '成本明细' in result:
+            for _, row in result['成本明细'].iterrows():
+                nd = str(row.get('节点', ''))
+                cost_data[nd] = {
+                    'total': float(row.get('总成本', 0) or 0),
+                    'liao':  float(row.get('材料成本', 0) or 0),
+                    'gong':  float(row.get('人工成本', 0) or 0),
+                    'fei':   float(row.get('制费成本', 0) or 0),
+                    'qty':   float(row.get('数量', 0) or 0),
+                }
+        
+        # 构建图结构
+        def build_edges():
+            edges = []
+            out_map = defaultdict(list)
+            in_map = defaultdict(list)
+            edge_weight = {}
+            for i in range(n):
+                for j in range(n):
+                    if W[i, j] > 0.001:
+                        src, tgt, w = all_nodes[j], all_nodes[i], float(W[i, j])
+                        edges.append((src, tgt, w))
+                        out_map[src].append((tgt, w))
+                        in_map[tgt].append((src, w))
+                        edge_weight[(src, tgt)] = w
+            return edges, out_map, in_map, edge_weight
+        
+        edges, out_map, in_map, edge_weight = build_edges()
+        
+        # BFS确定层级
+        node_level = {}
+        visited = set()
+        queue = deque()
+        
+        for nd in material_nodes:
+            if not in_map[nd]:
+                node_level[nd] = 0
+                queue.append(nd)
+                visited.add(nd)
+        
+        if not queue and material_nodes:
+            first = list(material_nodes)[0]
+            node_level[first] = 0
+            queue.append(first)
+            visited.add(first)
+        
+        while queue:
+            cur = queue.popleft()
+            for tgt, _ in out_map[cur]:
+                if tgt not in visited:
+                    node_level[tgt] = node_level[cur] + 1
+                    visited.add(tgt)
+                    queue.append(tgt)
+        
+        for nd in all_nodes:
+            if nd not in node_level:
+                node_level[nd] = 99
+        
+        # 聚合视图
+        def _sankey_aggregate():
+            flow = defaultdict(float)
+            for src, tgt, w in edges:
+                src_lvl = node_level.get(src, 0)
+                tgt_lvl = node_level.get(tgt, 0)
+                src_cost = cost_data.get(src, {}).get('total', 0)
+                val = w * src_cost if src_cost else w * 1000
+                
+                src_type = f"物料_L{src_lvl}" if src in material_nodes else '工单'
+                tgt_type = f"物料_L{tgt_lvl}" if tgt in material_nodes else '工单'
+                
+                if src_type != tgt_type:
+                    flow[(src_type, tgt_type)] += val
+            
+            if not flow:
+                return None
+            
+            all_types = set()
+            for (s, t), _ in flow.items():
+                all_types.add(s)
+                all_types.add(t)
+            
+            def sort_key(t):
+                if t == '工单':
+                    return (1, 0)
+                if t.startswith('物料_L'):
+                    return (0, int(t.split('L')[1]))
+                return (2, 0)
+            
+            node_list = sorted(all_types, key=sort_key)
+            type_idx = {t: i for i, t in enumerate(node_list)}
+            
+            type_cost = defaultdict(float)
+            for nd in all_nodes:
+                lvl = node_level.get(nd, 0)
+                tp = f"物料_L{lvl}" if nd in material_nodes else '工单'
+                type_cost[tp] += cost_data.get(nd, {}).get('total', 0)
+            
+            node_colors = [TYPE_FILL.get(t, '#D3D1C7') for t in node_list]
+            node_custom = [f"类型：{t}<br>累计成本：¥{type_cost[t]:,.0f}" for t in node_list]
+            
+            sources, targets, values, lcolors = [], [], [], []
+            for (st, tt), val in flow.items():
+                if st in type_idx and tt in type_idx and val > 1:
+                    sources.append(type_idx[st])
+                    targets.append(type_idx[tt])
+                    values.append(val)
+                    stroke = TYPE_STROKE.get(st, '#888780')
+                    r, g, b = int(stroke[1:3], 16), int(stroke[3:5], 16), int(stroke[5:7], 16)
+                    lcolors.append(f'rgba({r},{g},{b},0.3)')
+            
+            fig = go.Figure(go.Sankey(
+                arrangement='snap',
+                node=dict(
+                    pad=40, thickness=28,
+                    line=dict(color='rgba(0,0,0,0.1)', width=0.5),
+                    label=node_list, color=node_colors,
+                    customdata=node_custom,
+                    hovertemplate='<b>%{label}</b><br>%{customdata}<extra></extra>',
+                ),
+                link=dict(
+                    source=sources, target=targets, value=values,
+                    color=lcolors,
+                    hovertemplate='%{value:,.0f}<extra></extra>',
+                ),
+            ))
+            fig.update_layout(
+                font=dict(family='Microsoft YaHei,sans-serif', size=13, color='#333'),
+                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=20, r=20, t=10, b=10), height=400,
+            )
+            return fig
+        
+        # 穿透视图
+        def _upstream_subgraph(target):
+            sub_nodes = {target}
+            queue = deque([target])
+            while queue:
+                cur = queue.popleft()
+                for src, _ in in_map[cur]:
+                    if src not in sub_nodes:
+                        sub_nodes.add(src)
+                        queue.append(src)
+            return sub_nodes
+        
+        def _network_single(target):
+            sub_nodes = _upstream_subgraph(target)
+            sub_edges = [(s, t, w) for s, t, w in edges if s in sub_nodes and t in sub_nodes]
+            
+            level_in_sub = {}
+            has_outgoing = {s for s, _, _ in sub_edges}
+            roots = [nd for nd in sub_nodes if nd not in has_outgoing]
+            if not roots:
+                roots = [target]
+            
+            visited = set()
+            queue = deque()
+            for nd in roots:
+                level_in_sub[nd] = 0
+                visited.add(nd)
+                queue.append(nd)
+            while queue:
+                cur = queue.popleft()
+                for tgt, _ in out_map[cur]:
+                    if tgt in sub_nodes and tgt not in visited:
+                        level_in_sub[tgt] = level_in_sub[cur] + 1
+                        visited.add(tgt)
+                        queue.append(tgt)
+            for nd in sub_nodes:
+                if nd not in level_in_sub:
+                    level_in_sub[nd] = 0
+            
+            level_nodes = defaultdict(list)
+            for nd in sorted(sub_nodes):
+                level_nodes[level_in_sub[nd]].append(nd)
+            
+            NW, NH = 130, 56
+            H_GAP, V_GAP = 100, 22
+            MX, MY = 50, 50
+            n_levels = max(level_nodes) + 1
+            max_col = max(len(v) for v in level_nodes.values())
+            SVG_W = MX*2 + n_levels*NW + (n_levels-1)*H_GAP
+            SVG_H = MY*2 + max_col*NH + (max_col-1)*V_GAP
+            
+            node_pos = {}
+            for lv, nodes in level_nodes.items():
+                x = MX + lv * (NW + H_GAP)
+                col_h = len(nodes)*NH + (len(nodes)-1)*V_GAP
+                start_y = (SVG_H - col_h) // 2
+                for idx, nd in enumerate(nodes):
+                    node_pos[nd] = (x, start_y + idx*(NH+V_GAP))
+            
+            def nj(nd):
+                c = cost_data.get(nd, {})
+                lvl = node_level.get(nd, 0)
+                tp = '工单' if nd in order_nodes else f'物料_L{lvl}'
+                d = {'name': nd, 'type': tp, 'total': c.get('total', 0),
+                     'liao': c.get('liao', 0), 'gong': c.get('gong', 0),
+                     'fei': c.get('fei', 0), 'qty': c.get('qty', 0)}
+                return json.dumps(d, ensure_ascii=False).replace('"', '&quot;')
+            
+            parts = [f'<svg id="sg" width="{SVG_W}" height="{SVG_H}" style="display:block;background:transparent;" xmlns="http://www.w3.org/2000/svg">']
+            parts.append('<defs>')
+            parts.append('<marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">')
+            parts.append('<path d="M2 1L8 5L2 9" fill="none" stroke="#aaa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>')
+            parts.append('</marker>')
+            parts.append('<marker id="arh" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">')
+            parts.append('<path d="M2 1L8 5L2 9" fill="none" stroke="#D85A30" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>')
+            parts.append('</marker>')
+            parts.append('</defs>')
+            
+            for src, tgt, w in sub_edges:
+                if src not in node_pos or tgt not in node_pos:
+                    continue
+                x1, y1 = node_pos[src]
+                x2, y2 = node_pos[tgt]
+                sx, sy = x1+NW, y1+NH//2
+                ex, ey = x2, y2+NH//2
+                cx = (sx+ex)//2
+                lw = max(1.0, min(3.5, 1.0+w*4))
+                parts.append(f'<path class="edge" data-src="{src}" data-tgt="{tgt}" d="M{sx},{sy} C{cx},{sy} {cx},{ey} {ex},{ey}" fill="none" stroke="#C8C5BC" stroke-width="{lw:.1f}" marker-end="url(#ar)" opacity="0.75"/>')
+            
+            for nd, (x, y) in node_pos.items():
+                lvl = node_level.get(nd, 0)
+                tp = '工单' if nd in order_nodes else f'物料_L{lvl}'
+                fill = TYPE_FILL.get(tp, '#D3D1C7')
+                stroke = TYPE_STROKE.get(tp, '#888780')
+                c = cost_data.get(nd, {})
+                cstr = f"¥{c['total']:,.0f}" if c.get('total') else ''
+                disp = nd[:10]+'...' if len(nd)>10 else nd
+                is_tgt = 'stroke-width="2.5"' if nd == target else 'stroke-width="1"'
+                ty = y + NH//2 - (8 if cstr else 0)
+                
+                parts.append(f'<g class="nd" data-info="{nj(nd)}" style="cursor:pointer;" onmouseenter="hiN(this)" onmouseleave="uhN(this)">')
+                parts.append(f'<rect x="{x}" y="{y}" width="{NW}" height="{NH}" rx="8" fill="{fill}" stroke="{stroke}" {is_tgt}/>')
+                parts.append(f'<text x="{x+NW//2}" y="{ty}" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#333">{disp}</text>')
+                if cstr:
+                    parts.append(f'<text x="{x+NW//2}" y="{ty+17}" text-anchor="middle" dominant-baseline="central" font-size="11" fill="{stroke}">{cstr}</text>')
+                parts.append('</g>')
+            parts.append('</svg>')
+            
+            html = '''<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:transparent}
+#wrap{padding:0}#scroll{overflow:auto;border:.5px solid #e5e5e5;border-radius:8px;background:#fafafa;padding:8px}
+.nd rect{transition:opacity .15s}.nd:hover rect{opacity:.82}
+#tip{position:fixed;display:none;pointer-events:none;background:#fff;border:.5px solid #ddd;border-radius:8px;padding:10px 14px;box-shadow:0 2px 12px rgba(0,0,0,.1);font-size:12px;color:#333;min-width:170px;z-index:999}
+.tt{font-weight:500;font-size:13px;margin-bottom:7px}
+.tr{display:flex;justify-content:space-between;gap:16px;margin:3px 0}
+.tk{color:#999}.br{display:flex;align-items:center;gap:6px;margin:3px 0}
+.bg{flex:1;height:5px;background:#eee;border-radius:3px}.bf{height:100%;border-radius:3px}
+</style></head><body>
+<div id="wrap"><div id="scroll">''' + '\n'.join(parts) + '''</div></div>
+<div id="tip"></div>
+<script>
+const tip=document.getElementById('tip');
+const f=n=>n?'¥'+n.toLocaleString('zh-CN',{maximumFractionDigits:0}):'—';
+const p=(a,t)=>t?(a/t*100).toFixed(1)+'%':'—';
+const br=(lb,v,t,col)=>{const pc=t?Math.round(v/t*100):0;return`<div class="br"><span style="width:18px;font-size:11px;color:#aaa">${lb}</span><div class="bg"><div class="bf" style="width:${pc}%;background:${col}"></div></div><span style="font-size:11px;color:#666;min-width:80px;text-align:right">${f(v)} (${p(v,t)})</span></div>`;};
+function hiN(el){
+const d=JSON.parse(el.dataset.info),nm=d.name;
+document.querySelectorAll('.edge').forEach(e=>{const on=e.dataset.src===nm||e.dataset.tgt===nm;e.setAttribute('stroke',on?'#D85A30':'#C8C5BC');e.setAttribute('opacity',on?'1':'0.1');e.setAttribute('marker-end',on?'url(#arh)':'url(#ar)');});
+const t=d.total;
+let h=`<div class="tt">${d.name}<span style="font-size:11px;font-weight:400;color:#999;margin-left:5px">${d.type}</span></div>`;
+if(t){h+=`<div class="tr"><span class="tk">总成本</span><span>${f(t)}</span></div>`;h+=br('料',d.liao,t,'#1D9E75')+br('工',d.gong,t,'#378ADD')+br('费',d.fei,t,'#D85A30');if(d.qty)h+=`<div class="tr" style="margin-top:5px"><span class="tk">数量</span><span>${d.qty.toLocaleString()} 件</span></div><div class="tr"><span class="tk">单价</span><span>¥${(t/d.qty).toFixed(2)}/件</span></div>`;}
+else h+='<div style="color:#bbb;font-size:11px">暂无成本数据</div>';
+tip.innerHTML=h;tip.style.display='block';
+}
+function uhN(){
+document.querySelectorAll('.edge').forEach(e=>{e.setAttribute('stroke','#C8C5BC');e.setAttribute('opacity','0.75');e.setAttribute('marker-end','url(#ar)');});
+tip.style.display='none';
+}
+document.addEventListener('mousemove',e=>{if(tip.style.display==='block'){tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';}});
+</script></body></html>'''
+            return html, SVG_H + 20, len(sub_nodes), sum(1 for nd in sub_nodes if nd in order_nodes)
+        
+        return _sankey_aggregate, _network_single
+        
+    except Exception as e:
+        import traceback
+        st.error(f"生成流向图失败: {e}")
+        st.code(traceback.format_exc())
+        return None, None
+
+
+def create_edge_table(calc):
+    """生成边表：相邻流转关系
+    
+    | 边ID | 起点 | 终点 | 消耗比例 | 产出比例 |
+    """
+    try:
+        if not hasattr(calc, 'W_matrix') or calc.W_matrix is None:
             return None
         
         W = calc.W_matrix
         all_nodes = calc.all_nodes
         material_nodes = calc.material_nodes
         order_nodes = calc.order_nodes
-        
         n = len(all_nodes)
         
-        # 创建网络图
-        net = Network(height="600px", width="100%", directed=True, 
-                      bgcolor="#ffffff", font_color="#333333")
+        rows = []
+        edge_id = 0
         
-        # 添加节点
-        for i, node in enumerate(all_nodes):
-            if node in order_nodes:
-                # 工单节点 - 绿色
-                net.add_node(node, label=node, color="#4CAF50", 
-                           size=25, title=f"工单: {node}", shape="box")
-            elif node in material_nodes:
-                # 物料节点 - 蓝色
-                net.add_node(node, label=node, color="#2196F3", 
-                           size=20, title=f"物料: {node}", shape="dot")
-        
-        # 添加边（W 矩阵中的非零元素）
         for i in range(n):
             for j in range(n):
-                if W[i, j] > 0.001:  # 只显示显著的流转
+                if W[i, j] > 0.001:
+                    edge_id += 1
                     source = all_nodes[j]
                     target = all_nodes[i]
-                    weight = W[i, j]
+                    weight = float(W[i, j])
                     
-                    # 边的粗细与权重成正比
-                    width = max(1, weight * 10)
+                    is_material_to_order = (source in material_nodes) and (target in order_nodes)
+                    is_order_to_material = (source in order_nodes) and (target in material_nodes)
                     
-                    # 箭头方向: source -> target
-                    net.add_edge(source, target, width=width, 
-                               title=f"系数: {weight:.4f}",
-                               arrows="to", color="#999999")
+                    consume_ratio = f"{weight:.2%}" if is_material_to_order else "—"
+                    output_ratio = f"{weight:.2%}" if is_order_to_material else "—"
+                    
+                    rows.append({
+                        '边ID': f"E{edge_id:03d}",
+                        '起点': source,
+                        '起点类型': '工单' if source in order_nodes else '物料',
+                        '终点': target,
+                        '终点类型': '工单' if target in order_nodes else '物料',
+                        '消耗比例': consume_ratio,
+                        '产出比例': output_ratio,
+                    })
         
-        # 物理布局参数
-        net.set_options("""
-        {
-          "physics": {
-            "forceAtlas2Based": {
-              "gravitationalConstant": -50,
-              "centralGravity": 0.01,
-              "springLength": 100,
-              "springConstant": 0.08
-            },
-            "maxVelocity": 50,
-            "solver": "forceAtlas2Based",
-            "timestep": 0.35,
-            "stabilization": {"iterations": 150}
-          },
-          "interaction": {
-            "hover": true,
-            "tooltipDelay": 200
-          }
-        }
-        """)
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
         
-        # 保存并读取HTML
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', 
-                                         delete=False, encoding='utf-8') as f:
-            temp_path = f.name
-        
-        net.save_graph(temp_path)
-        
-        with open(temp_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
-        
-        os.unlink(temp_path)
-        
-        return html_content
-        
-    except ImportError:
-        st.error("请安装 pyvis: pip install pyvis")
-        return None
     except Exception as e:
-        st.error(f"生成网络图失败: {e}")
+        import traceback
+        st.error(f"生成边表失败: {e}")
+        st.code(traceback.format_exc())
         return None
+
+
+def create_path_table(calc):
+    """生成路径表：完整的根到叶路径，带消耗关系
+    
+    列顺序：路径ID | 第1层 | 第2层 | ... | 第N层 | 最终成品 | 消耗关系
+    """
+    try:
+        if not hasattr(calc, 'W_matrix') or calc.W_matrix is None:
+            return None
+        
+        W = calc.W_matrix
+        all_nodes = calc.all_nodes
+        material_nodes = calc.material_nodes
+        order_nodes = calc.order_nodes
+        n = len(all_nodes)
+        
+        # 构建图结构，带权重
+        out_edges = {node: [] for node in all_nodes}
+        in_edges = {node: [] for node in all_nodes}
+        edge_weight = {}
+        
+        for i in range(n):
+            for j in range(n):
+                if W[i, j] > 0.001:
+                    source = all_nodes[j]
+                    target = all_nodes[i]
+                    weight = float(W[i, j])
+                    out_edges[source].append(target)
+                    in_edges[target].append(source)
+                    edge_weight[(source, target)] = weight
+        
+        # 找出根节点（初始物料：没有入边）
+        roots = [node for node in material_nodes if not in_edges[node]]
+        
+        if not roots:
+            roots = list(material_nodes)
+        
+        # 找出叶节点（最终成品：没有出边的物料）
+        leaves = [node for node in material_nodes if not out_edges[node]]
+        
+        # DFS找所有路径，同时记录权重
+        all_paths = []
+        
+        def dfs(current, path, weights, visited):
+            if current in visited:
+                return
+            
+            new_path = path + [current]
+            new_visited = visited | {current}
+            
+            # 如果是叶节点，记录路径
+            if current in leaves and len(new_path) >= 2:
+                all_paths.append((new_path, weights))
+                return
+            
+            # 继续DFS
+            for next_node in out_edges[current]:
+                w = edge_weight.get((current, next_node), 1.0)
+                dfs(next_node, new_path, weights + [w], new_visited)
+        
+        for root in roots:
+            dfs(root, [], [], set())
+        
+        # 计算最大层数
+        max_layers = max(len(path) for path, _ in all_paths) if all_paths else 0
+        
+        # 构建路径表
+        rows = []
+        for idx, (path, weights) in enumerate(all_paths, 1):
+            row = {'路径ID': f"P{idx:03d}"}
+            
+            # 填充所有层级列
+            for i in range(1, max_layers + 1):
+                if i <= len(path):
+                    row[f'第{i}层'] = path[i - 1]
+                else:
+                    row[f'第{i}层'] = ''
+            
+            # 最终成品
+            final_product = None
+            for node in reversed(path):
+                if node in material_nodes:
+                    final_product = node
+                    break
+            row['最终成品'] = final_product if final_product else path[-1]
+            
+            # 消耗关系
+            consume_ratios = []
+            for i in range(len(path) - 1):
+                src, dst = path[i], path[i + 1]
+                w = edge_weight.get((src, dst), 1.0)
+                consume_ratios.append(f"{w:.0%}")
+            
+            if consume_ratios:
+                row['消耗关系'] = ' × '.join(consume_ratios)
+            else:
+                row['消耗关系'] = '—'
+            
+            rows.append(row)
+        
+        # 创建DataFrame并确保列顺序
+        if rows:
+            df = pd.DataFrame(rows)
+            layer_cols = [f'第{i}层' for i in range(1, max_layers + 1)]
+            col_order = ['路径ID'] + layer_cols + ['最终成品', '消耗关系']
+            df = df[col_order]
+            return df
+        
+        return pd.DataFrame()
+        
+    except Exception as e:
+        import traceback
+        st.error(f"生成路径表失败: {e}")
+        st.code(traceback.format_exc())
+        return None
+
 
 # ==================== Session State 初始化 ====================
 def init_session_state():
@@ -502,27 +899,30 @@ def render_cost_accounting():
         
         if batch_files:
             for f in batch_files:
-                if f.name.endswith('.zip'):
-                    # 处理 ZIP 文件
-                    try:
-                        with zipfile.ZipFile(f) as z:
-                            for name in z.namelist():
-                                if name.endswith(('.xlsx', '.xls')):
-                                    file_type, type_name = detect_file_type(name)
-                                    if file_type:
-                                        with z.open(name) as excel_file:
-                                            auto_detected[file_type] = (excel_file, type_name, name)
-                                        st.success(f"📦 ZIP 中找到: {type_name} - {name}")
-                    except Exception as e:
-                        st.error(f"无法读取 ZIP 文件: {e}")
-                else:
-                    # 处理单个 Excel 文件
-                    file_type, type_name = detect_file_type(f.name)
-                    if file_type:
-                        auto_detected[file_type] = (f, type_name, f.name)
-                        st.success(f"✓ 识别为 {type_name}: {f.name}")
+                try:
+                    if f.name.endswith('.zip'):
+                        # 处理 ZIP 文件
+                        try:
+                            with zipfile.ZipFile(f) as z:
+                                for name in z.namelist():
+                                    if name.endswith(('.xlsx', '.xls')):
+                                        file_type, type_name = detect_file_type(name)
+                                        if file_type:
+                                            with z.open(name) as excel_file:
+                                                auto_detected[file_type] = (excel_file, type_name, name)
+                                            st.success(f"📦 ZIP 中找到: {type_name} - {name}")
+                        except Exception as e:
+                            st.error(f"无法读取 ZIP 文件 {f.name}: {e}")
                     else:
-                        st.warning(f"⚠️ 无法识别文件类型: {f.name}")
+                        # 处理单个 Excel 文件
+                        file_type, type_name = detect_file_type(f.name)
+                        if file_type:
+                            auto_detected[file_type] = (f, type_name, f.name)
+                            st.success(f"✓ 识别为 {type_name}: {f.name}")
+                        else:
+                            st.warning(f"⚠️ 无法识别文件类型: {f.name}")
+                except Exception as e:
+                    st.error(f"处理文件 {f.name} 时出错: {e}")
     
     st.divider()
     
@@ -618,7 +1018,7 @@ def render_cost_accounting():
             elif is_required:
                 st.info(f"⬆️ 请上传文件，或使用上方批量上传功能")
     
-    # ==================== 步骤2: 执行计算 ====================
+    # ==================== 步骤2: 计算选项与执行 ====================
     st.divider()
     st.markdown("#### 🚀 执行计算")
     
@@ -627,6 +1027,17 @@ def render_cost_accounting():
     if not ready:
         st.warning("⚠️ 请至少上传【采购入库】和【投入产出明细】文件")
         return
+    
+    # 计算选项
+    col_opt1, col_opt2 = st.columns([1, 2])
+    with col_opt1:
+        calculate_step_method = st.checkbox(
+            "📊 计算逐步结转法", 
+            value=False,
+            help="逐步结转法下，人工制费按(I+W×D)×F计算，材料=总成本-人工-制费"
+        )
+    with col_opt2:
+        st.caption("💡 默认使用平行结转法（成本还原）。勾选后将额外计算逐步结转法结果")
     
     if st.button("🚀 执行成本核算", type="primary", use_container_width=True):
         with st.spinner("正在计算..."):
@@ -651,9 +1062,9 @@ def render_cost_accounting():
                 if fin_file and fin_map:
                     fin_file.seek(0)
                     finished_df = pd.read_excel(fin_file)
-                    result = calc.calculate(finished_df, fin_map)
+                    result = calc.calculate(finished_df, fin_map, calculate_step_method=calculate_step_method)
                 else:
-                    result = calc.calculate()
+                    result = calc.calculate(calculate_step_method=calculate_step_method)
                 total_time = time.time() - start
                 
                 # 保存结果到 session state - 包含数据和计算器实例
@@ -687,8 +1098,26 @@ def render_cost_accounting():
         # 性能指标
         render_time_metrics(perf, total_time)
         
-        # 结果标签页
-        tab1, tab2, tab3 = st.tabs(["📋 收发存汇总", "📊 工单投入产出明细", "📈 成本明细"])
+        # 结果标签页 - 根据是否有逐步结转法结果动态调整
+        has_step_result = '逐步结转_工单明细' in result and '逐步结转_成本明细' in result
+        
+        if has_step_result:
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                "📋 收发存汇总", 
+                "📊 工单投入产出明细", 
+                "📈 成本明细",
+                "🕸️ 材料流向图",
+                "⛓️ 边表与路径表",
+                "🔄 逐步结转法"
+            ])
+        else:
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "📋 收发存汇总", 
+                "📊 工单投入产出明细", 
+                "📈 成本明细",
+                "🕸️ 材料流向图",
+                "⛓️ 边表与路径表"
+            ])
         
         with tab1:
             # 统计卡片
@@ -716,25 +1145,107 @@ def render_cost_accounting():
             st.dataframe(result['成本明细'].sort_values('总成本', ascending=False),
                         use_container_width=True, height=500)
         
-        with tab3:
-            st.markdown("##### 材料流转网络图")
-            st.caption("蓝色圆点 = 物料节点，绿色方框 = 工单节点，连线粗细 = 流转系数")
+        with tab4:
+            st.markdown("##### 材料成本流向可视化")
+            st.caption("📍 聚合视图看整体结构，穿透视图看单品链路")
             
             calc = st.session_state.cost_calc
             if calc:
-                graph_html = create_network_graph(calc)
-                if graph_html:
-                    st.components.v1.html(graph_html, height=620, scrolling=False)
+                agg_func, single_func = create_sankey_graph(calc, result)
+                
+                if agg_func and single_func:
+                    sub_tab1, sub_tab2 = st.tabs(["📊 聚合视图（按层级）", "🔍 穿透视图（单品）"])
+                    
+                    with sub_tab1:
+                        st.caption("将所有节点按层级聚合，看整体成本结构")
+                        fig = agg_func()
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("暂无聚合数据")
+                    
+                    with sub_tab2:
+                        st.caption("选择一个节点，查看它的上游供应链路")
+                        candidates = sorted(calc.all_nodes)
+                        target = st.selectbox("选择要穿透的节点", candidates, help="选择任意节点查看其上游链路")
+                        if target:
+                            html, h, node_cnt, order_cnt = single_func(target)
+                            st.caption(f"上游链路共 **{node_cnt}** 个节点，**{order_cnt}** 个工单")
+                            st.components.v1.html(html, height=h, scrolling=True)
                 else:
-                    st.info("网络图生成失败，请检查 pyvis 是否安装")
+                    st.info("流向图生成失败")
+        
+        with tab5:
+            st.markdown("##### 边表：相邻流转关系")
+            st.caption("起点 → 终点的直接流转关系，已包含在Excel导出中")
+            
+            calc = st.session_state.cost_calc
+            if calc:
+                edge_df = create_edge_table(calc)
+                if edge_df is not None and not edge_df.empty:
+                    st.dataframe(edge_df, use_container_width=True, height=350)
+                else:
+                    st.info("暂无边数据")
+            
+            st.divider()
+            
+            st.markdown("##### 路径表：根到叶的完整路径")
+            st.caption("从初始物料到最终成品的完整链条，已包含在Excel导出中")
+            
+            if calc:
+                path_df = create_path_table(calc)
+                if path_df is not None and not path_df.empty:
+                    st.dataframe(path_df, use_container_width=True, height=350)
+                else:
+                    st.info("暂无路径数据")
+        
+        # Tab 6: 逐步结转法结果（如果有）
+        if has_step_result:
+            with tab6:
+                st.markdown("##### 逐步结转法计算结果")
+                st.info("""
+                **逐步结转法说明**：
+                - **人工** = (I + W×D) × F_工，即本期人工加上上一步转入的人工
+                - **制费** = (I + W×D) × F_制费，即本期制费加上上一步转入的制费  
+                - **材料** = X总成本 - 人工 - 制费，剩余部分为综合材料成本
+                """)
+                
+                sub_tab1, sub_tab2 = st.tabs(["📊 工单投入产出明细", "📈 成本明细"])
+                
+                with sub_tab1:
+                    st.dataframe(result['逐步结转_工单明细'].sort_values('工单号'),
+                                use_container_width=True, height=500)
+                
+                with sub_tab2:
+                    st.dataframe(result['逐步结转_成本明细'].sort_values('总成本', ascending=False),
+                                use_container_width=True, height=500)
         
         # 下载按钮
         st.divider()
-        excel = to_excel({
+        
+        # 准备导出数据
+        export_sheets = {
             '收发存汇总': result['收发存'],
             '工单投入产出明细': result['工单明细'],
             '成本明细': result['成本明细']
-        })
+        }
+        
+        # 添加逐步结转法结果（如果有）
+        if has_step_result:
+            export_sheets['逐步结转_工单明细'] = result['逐步结转_工单明细']
+            export_sheets['逐步结转_成本明细'] = result['逐步结转_成本明细']
+        
+        # 添加边表和路径表
+        calc = st.session_state.cost_calc
+        if calc:
+            edge_df = create_edge_table(calc)
+            path_df = create_path_table(calc)
+            if edge_df is not None and not edge_df.empty:
+                export_sheets['边表_相邻流转关系'] = edge_df
+            if path_df is not None and not path_df.empty:
+                export_sheets['路径表_根到叶路径'] = path_df
+        
+        excel = to_excel(export_sheets)
         st.download_button("📥 下载Excel结果", excel, "成本核算结果.xlsx", 
                           use_container_width=True)
 
@@ -958,14 +1469,21 @@ def render_cost_restoration():
         step_df = st.session_state.step_cost_file
         step_map = st.session_state.step_cost_mapping
         
+        # 反转映射用于读取数据
+        reverse_map = {v: k for k, v in step_map.items()}
+        col_mat = reverse_map.get('料')
+        col_lab = reverse_map.get('工')
+        col_oh = reverse_map.get('费')
+        col_code = reverse_map.get('物料编码')
+        
         comparison = []
         for _, row in step_df.iterrows():
-            mat = str(row[step_map['物料编码']])
+            mat = str(row[col_code])
             if mat in calc.node_index:
                 idx = calc.node_index[mat]
-                step_mat = row[step_map['料']]
-                step_lab = row[step_map['工']]
-                step_oh = row[step_map['费']]
+                step_mat = row[col_mat]
+                step_lab = row[col_lab]
+                step_oh = row[col_oh]
                 step_total = step_mat + step_lab + step_oh
                 
                 rest_mat, rest_lab, rest_oh = result['restored_costs'][idx]
