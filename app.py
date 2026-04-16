@@ -390,7 +390,7 @@ def create_sankey_graph(calc, result=None):
             if nd not in node_level:
                 node_level[nd] = 99
         
-        # 聚合视图
+        # 聚合视图 - 简洁桑基图
         def _sankey_aggregate():
             flow = defaultdict(float)
             for src, tgt, w in edges:
@@ -440,13 +440,14 @@ def create_sankey_graph(calc, result=None):
                     values.append(val)
                     stroke = TYPE_STROKE.get(st, '#888780')
                     r, g, b = int(stroke[1:3], 16), int(stroke[3:5], 16), int(stroke[5:7], 16)
-                    lcolors.append(f'rgba({r},{g},{b},0.3)')
+                    lcolors.append(f'rgba({r},{g},{b},0.4)')
             
             fig = go.Figure(go.Sankey(
-                arrangement='snap',
+                arrangement='fixed',
+                orientation='h',
                 node=dict(
-                    pad=40, thickness=28,
-                    line=dict(color='rgba(0,0,0,0.1)', width=0.5),
+                    pad=20, thickness=24,
+                    line=dict(color='rgba(0,0,0,0.08)', width=1),
                     label=node_list, color=node_colors,
                     customdata=node_custom,
                     hovertemplate='<b>%{label}</b><br>%{customdata}<extra></extra>',
@@ -458,9 +459,9 @@ def create_sankey_graph(calc, result=None):
                 ),
             ))
             fig.update_layout(
-                font=dict(family='Microsoft YaHei,sans-serif', size=13, color='#333'),
+                font=dict(family='Microsoft YaHei,sans-serif', size=12, color='#333'),
                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                margin=dict(l=20, r=20, t=10, b=10), height=400,
+                margin=dict(l=30, r=30, t=20, b=20), height=350,
             )
             return fig
         
@@ -507,17 +508,22 @@ def create_sankey_graph(calc, result=None):
             for nd in sorted(sub_nodes):
                 level_nodes[level_in_sub[nd]].append(nd)
             
-            NW, NH = 130, 56
-            H_GAP, V_GAP = 100, 22
-            MX, MY = 50, 50
+            # 横向布局：层级从左到右排列
+            NW, NH = 120, 44
+            H_GAP, V_GAP = 80, 36
+            MX, MY = 40, 40
             n_levels = max(level_nodes) + 1
             max_col = max(len(v) for v in level_nodes.values())
+            
+            # 计算SVG尺寸：宽度基于层级，高度基于最大列数
             SVG_W = MX*2 + n_levels*NW + (n_levels-1)*H_GAP
             SVG_H = MY*2 + max_col*NH + (max_col-1)*V_GAP
             
             node_pos = {}
             for lv, nodes in level_nodes.items():
+                # x坐标基于层级（从左到右）
                 x = MX + lv * (NW + H_GAP)
+                # y坐标垂直居中排列
                 col_h = len(nodes)*NH + (len(nodes)-1)*V_GAP
                 start_y = (SVG_H - col_h) // 2
                 for idx, nd in enumerate(nodes):
@@ -574,13 +580,14 @@ def create_sankey_graph(calc, result=None):
             
             html = '''<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:transparent}
-#wrap{padding:0}#scroll{overflow:auto;border:.5px solid #e5e5e5;border-radius:8px;background:#fafafa;padding:8px}
-.nd rect{transition:opacity .15s}.nd:hover rect{opacity:.82}
-#tip{position:fixed;display:none;pointer-events:none;background:#fff;border:.5px solid #ddd;border-radius:8px;padding:10px 14px;box-shadow:0 2px 12px rgba(0,0,0,.1);font-size:12px;color:#333;min-width:170px;z-index:999}
-.tt{font-weight:500;font-size:13px;margin-bottom:7px}
-.tr{display:flex;justify-content:space-between;gap:16px;margin:3px 0}
-.tk{color:#999}.br{display:flex;align-items:center;gap:6px;margin:3px 0}
-.bg{flex:1;height:5px;background:#eee;border-radius:3px}.bf{height:100%;border-radius:3px}
+#wrap{padding:0}#scroll{overflow:auto;border:1px solid #e8e8e8;border-radius:10px;background:#f8f9fa;padding:16px;box-shadow:inset 0 1px 3px rgba(0,0,0,0.05)}
+.nd rect{transition:all .2s ease}.nd:hover rect{opacity:0.9;filter:brightness(0.97)}
+.edge{transition:all .2s ease}
+#tip{position:fixed;display:none;pointer-events:none;background:#fff;border:1px solid #e8e8e8;border-radius:10px;padding:12px 16px;box-shadow:0 4px 20px rgba(0,0,0,.12);font-size:12px;color:#333;min-width:180px;z-index:999}
+.tt{font-weight:600;font-size:14px;margin-bottom:8px;color:#1a1a1a}
+.tr{display:flex;justify-content:space-between;gap:20px;margin:4px 0}
+.tk{color:#888;font-size:12px}.br{display:flex;align-items:center;gap:8px;margin:4px 0}
+.bg{flex:1;height:6px;background:#f0f0f0;border-radius:3px;overflow:hidden}.bf{height:100%;border-radius:3px;transition:width 0.3s ease}
 </style></head><body>
 <div id="wrap"><div id="scroll">''' + '\n'.join(parts) + '''</div></div>
 <div id="tip"></div>
@@ -1137,9 +1144,22 @@ def render_cost_accounting():
                         use_container_width=True, height=400)
         
         with tab2:
-            st.markdown("##### 工单投入产出明细（在产与完工拆分）")
-            st.dataframe(result['工单明细'].sort_values('工单号'),
-                        use_container_width=True, height=500)
+            # 工单明细分两个子Tab：汇总表和明细表
+            sub_tab1, sub_tab2 = st.tabs(["📊 投入产出汇总表", "🔍 投入产出明细表"])
+            
+            with sub_tab1:
+                st.markdown("##### 投入产出汇总表（按工单+产品聚合）")
+                st.dataframe(result['工单明细'].sort_values('工单号'),
+                            use_container_width=True, height=500)
+            
+            with sub_tab2:
+                st.markdown("##### 投入产出明细表（按工单+产品+材料展开）")
+                st.caption("追踪每个材料的成本流转：材料 → 工单 → 产品 → 完工/在产")
+                if '工单产品材料明细' in result and not result['工单产品材料明细'].empty:
+                    st.dataframe(result['工单产品材料明细'].sort_values(['工单号', '产品编码', '材料编码']),
+                                use_container_width=True, height=500)
+                else:
+                    st.info("暂无工单-产品-材料明细数据")
         
         with tab3:
             st.dataframe(result['成本明细'].sort_values('总成本', ascending=False),
@@ -1210,13 +1230,23 @@ def render_cost_accounting():
                 - **材料** = X总成本 - 人工 - 制费，剩余部分为综合材料成本
                 """)
                 
-                sub_tab1, sub_tab2 = st.tabs(["📊 工单投入产出明细", "📈 成本明细"])
+                sub_tab1, sub_tab2, sub_tab3 = st.tabs(["📊 投入产出汇总表", "🔍 投入产出明细表", "📈 成本明细"])
                 
                 with sub_tab1:
+                    st.markdown("##### 逐步结转法 - 投入产出汇总表")
                     st.dataframe(result['逐步结转_工单明细'].sort_values('工单号'),
                                 use_container_width=True, height=500)
                 
                 with sub_tab2:
+                    st.markdown("##### 逐步结转法 - 投入产出明细表")
+                    if '逐步结转_工单产品材料明细' in result and not result['逐步结转_工单产品材料明细'].empty:
+                        st.dataframe(result['逐步结转_工单产品材料明细'].sort_values(['工单号', '产品编码', '材料编码']),
+                                    use_container_width=True, height=500)
+                    else:
+                        st.info("暂无逐步结转法明细数据")
+                
+                with sub_tab3:
+                    st.markdown("##### 逐步结转法 - 成本明细")
                     st.dataframe(result['逐步结转_成本明细'].sort_values('总成本', ascending=False),
                                 use_container_width=True, height=500)
         
@@ -1226,13 +1256,15 @@ def render_cost_accounting():
         # 准备导出数据
         export_sheets = {
             '收发存汇总': result['收发存'],
-            '工单投入产出明细': result['工单明细'],
+            '投入产出汇总表': result['工单明细'],
+            '投入产出明细表': result['工单产品材料明细'] if '工单产品材料明细' in result else pd.DataFrame(),
             '成本明细': result['成本明细']
         }
         
         # 添加逐步结转法结果（如果有）
         if has_step_result:
-            export_sheets['逐步结转_工单明细'] = result['逐步结转_工单明细']
+            export_sheets['逐步结转_投入产出汇总表'] = result['逐步结转_工单明细']
+            export_sheets['逐步结转_投入产出明细表'] = result.get('逐步结转_工单产品材料明细', pd.DataFrame())
             export_sheets['逐步结转_成本明细'] = result['逐步结转_成本明细']
         
         # 添加边表和路径表

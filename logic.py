@@ -482,6 +482,141 @@ class CostCalculator:
                 '工单总成本': round(wip_mat + finished_mat + finished_lab + finished_oh, 2),  # 调试用
             })
         
+        # 8.2b 工单-产品-材料三维明细（新增）
+        # 【核心修正】材料成本分配逻辑：
+        # 1. 工单-产品-汇总表的成本是正确的（基于W矩阵和完工率D）
+        # 2. 明细表应该按"领用数量权重"把汇总表的成本拆分到各材料行
+        # 即：每行材料成本 = 工单-产品总材料成本 × (该行领用数量 / 该工单-产品总领用数量)
+        order_prod_mat_detail_list = []
+        
+        # 获取工单-产品的完工/在产数量
+        order_prod_qty = self.io_df.groupby(['工单号', '产品编码']).agg({
+            '产品完工数量': 'sum',
+            '在产品数量': 'sum'
+        }).reset_index()
+        order_prod_qty_dict = {}
+        for _, row in order_prod_qty.iterrows():
+            key = (str(row['工单号']), str(row['产品编码']))
+            order_prod_qty_dict[key] = (row['产品完工数量'], row['在产品数量'])
+        
+        # 第一步：计算每个工单-产品的总领用数量（用于材料成本分配）
+        order_prod_total_issue = {}
+        for _, row in self.io_df.iterrows():
+            order = str(row['工单号'])
+            product = str(row['产品编码'])
+            issue_qty = row['材料领用数量']
+            
+            key = (order, product)
+            if key not in order_prod_total_issue:
+                order_prod_total_issue[key] = 0
+            order_prod_total_issue[key] += issue_qty
+        
+        # 第二步：先计算工单-产品-汇总表的数据（与汇总表一致）
+        order_prod_summary_data = {}
+        for _, row in order_prod_summary.iterrows():
+            order = str(row['工单号'])
+            product = str(row['产品编码'])
+            
+            if order not in self.node_index or product not in self.node_index:
+                continue
+            
+            order_idx = self.node_index[order]
+            prod_idx = self.node_index[product]
+            w_ratio = W_dense[prod_idx, order_idx]
+            finished_ratio = D_mat[order_idx]
+            
+            order_total_mat = X[order_idx, 0]
+            order_total_lab = X[order_idx, 1]
+            order_total_oh = X[order_idx, 2]
+            
+            # 与汇总表一致的计算
+            finished_mat = w_ratio * order_total_mat * finished_ratio
+            wip_mat = w_ratio * order_total_mat * (1 - finished_ratio)
+            finished_lab = w_ratio * order_total_lab
+            finished_oh = w_ratio * order_total_oh
+            
+            key = (order, product)
+            order_prod_summary_data[key] = {
+                'finished_mat': finished_mat,
+                'wip_mat': wip_mat,
+                'finished_lab': finished_lab,
+                'finished_oh': finished_oh,
+                'w_ratio': w_ratio,
+                'finished_ratio': finished_ratio
+            }
+        
+        # 第三步：遍历生成明细表，按领用数量权重拆分
+        for _, row in self.io_df.iterrows():
+            order = str(row['工单号'])
+            product = str(row['产品编码'])
+            material = str(row['材料编码'])
+            issue_qty = row['材料领用数量']
+            
+            if order not in self.node_index or product not in self.node_index or material not in self.node_index:
+                continue
+            
+            order_idx = self.node_index[order]
+            prod_idx = self.node_index[product]
+            mat_idx = self.node_index[material]
+            
+            # W矩阵比例（用于展示）
+            w_mat_to_order = W_dense[order_idx, mat_idx]
+            w_order_to_prod = W_dense[prod_idx, order_idx]
+            finished_ratio = D_mat[order_idx]
+            
+            # 获取该工单-产品的汇总数据
+            key = (order, product)
+            summary = order_prod_summary_data.get(key, {
+                'finished_mat': 0, 'wip_mat': 0, 'finished_lab': 0, 'finished_oh': 0,
+                'w_ratio': 0, 'finished_ratio': 0
+            })
+            
+            # 获取该工单-产品的总领用数量
+            total_issue = order_prod_total_issue.get(key, 1)
+            
+            # 按领用数量权重拆分成本
+            if total_issue > 0:
+                weight = issue_qty / total_issue
+                finished_mat_cost = summary['finished_mat'] * weight
+                wip_mat_cost = summary['wip_mat'] * weight
+                finished_lab_cost = summary['finished_lab'] * weight
+                finished_oh_cost = summary['finished_oh'] * weight
+            else:
+                # 如果没有领用数量（只有工费），则材料成本为0，但工费需要分配
+                # 按行数平均分配工费
+                finished_mat_cost = 0
+                wip_mat_cost = 0
+                # 获取该工单-产品的行数
+                row_count = len([r for r in self.io_df.iterrows() 
+                                 if str(r[1]['工单号']) == order and str(r[1]['产品编码']) == product])
+                if row_count > 0:
+                    finished_lab_cost = summary['finished_lab'] / row_count
+                    finished_oh_cost = summary['finished_oh'] / row_count
+                else:
+                    finished_lab_cost = summary['finished_lab']
+                    finished_oh_cost = summary['finished_oh']
+            
+            # 获取该行的完工/在产数量（直接取原始数据）
+            finished_q = row['产品完工数量']
+            wip_q = row['在产品数量']
+            
+            order_prod_mat_detail_list.append({
+                '工单号': order,
+                '产品编码': product,
+                '材料编码': material,
+                '材料领用数量': round(issue_qty, 2),
+                'W_材料到工单': round(w_mat_to_order, 4),
+                'W_工单到产品': round(w_order_to_prod, 4),
+                '完工率': round(finished_ratio, 4),
+                '完工数量': round(finished_q, 2),
+                '在产品数量': round(wip_q, 2),
+                '在产品材料费': round(wip_mat_cost, 2),
+                '完工产品材料费': round(finished_mat_cost, 2),
+                '完工产品直接人工': round(finished_lab_cost, 2),
+                '完工产品制造费用': round(finished_oh_cost, 2),
+                '成本小计': round(wip_mat_cost + finished_mat_cost + finished_lab_cost + finished_oh_cost, 2),
+            })
+        
         # 8.3 成本明细
         detail_list = []
         for i, node in enumerate(self.all_nodes):
@@ -677,6 +812,125 @@ class CostCalculator:
                     '工单总成本': round(wip_S_mat + finished_S_mat + finished_S_lab + finished_S_oh, 2),
                 })
             
+            # 构建逐步结转法的工单-产品-材料三维明细（与平行结转法逻辑相同，只是用S矩阵）
+            step_order_prod_mat_detail_list = []
+            
+            # 第一步：计算每个工单-产品的总领用数量（用于材料成本分配）
+            step_order_prod_total_issue = {}
+            for _, row in self.io_df.iterrows():
+                order = str(row['工单号'])
+                product = str(row['产品编码'])
+                issue_qty = row['材料领用数量']
+                
+                key = (order, product)
+                if key not in step_order_prod_total_issue:
+                    step_order_prod_total_issue[key] = 0
+                step_order_prod_total_issue[key] += issue_qty
+            
+            # 第二步：先计算工单-产品-汇总表的数据（逐步结转法，与汇总表一致）
+            step_order_prod_summary_data = {}
+            for _, row in order_prod_summary.iterrows():
+                order = str(row['工单号'])
+                product = str(row['产品编码'])
+                
+                if order not in self.node_index or product not in self.node_index:
+                    continue
+                
+                order_idx = self.node_index[order]
+                prod_idx = self.node_index[product]
+                w_ratio = W_dense[prod_idx, order_idx]
+                finished_ratio = D_mat[order_idx]
+                
+                # 逐步结转法使用S矩阵
+                order_S_mat = S[order_idx, 0]
+                order_S_lab = S[order_idx, 1]
+                order_S_oh = S[order_idx, 2]
+                
+                # 与汇总表一致的计算
+                finished_mat = w_ratio * order_S_mat * finished_ratio
+                wip_mat = w_ratio * order_S_mat * (1 - finished_ratio)
+                finished_lab = w_ratio * order_S_lab
+                finished_oh = w_ratio * order_S_oh
+                
+                key = (order, product)
+                step_order_prod_summary_data[key] = {
+                    'finished_mat': finished_mat,
+                    'wip_mat': wip_mat,
+                    'finished_lab': finished_lab,
+                    'finished_oh': finished_oh
+                }
+            
+            # 第三步：遍历生成明细表，按领用数量权重拆分
+            for _, row in self.io_df.iterrows():
+                order = str(row['工单号'])
+                product = str(row['产品编码'])
+                material = str(row['材料编码'])
+                issue_qty = row['材料领用数量']
+                
+                if order not in self.node_index or product not in self.node_index or material not in self.node_index:
+                    continue
+                
+                order_idx = self.node_index[order]
+                prod_idx = self.node_index[product]
+                mat_idx = self.node_index[material]
+                
+                # W矩阵比例（用于展示）
+                w_mat_to_order = W_dense[order_idx, mat_idx]
+                w_order_to_prod = W_dense[prod_idx, order_idx]
+                finished_ratio = D_mat[order_idx]
+                
+                # 获取该工单-产品的汇总数据
+                key = (order, product)
+                summary = step_order_prod_summary_data.get(key, {
+                    'finished_mat': 0, 'wip_mat': 0, 'finished_lab': 0, 'finished_oh': 0
+                })
+                
+                # 获取该工单-产品的总领用数量
+                total_issue = step_order_prod_total_issue.get(key, 1)
+                
+                # 按领用数量权重拆分成本
+                if total_issue > 0:
+                    weight = issue_qty / total_issue
+                    finished_mat_cost = summary['finished_mat'] * weight
+                    wip_mat_cost = summary['wip_mat'] * weight
+                    finished_lab_cost = summary['finished_lab'] * weight
+                    finished_oh_cost = summary['finished_oh'] * weight
+                else:
+                    # 如果没有领用数量（只有工费），则材料成本为0，但工费需要分配
+                    # 按行数平均分配工费
+                    finished_mat_cost = 0
+                    wip_mat_cost = 0
+                    # 获取该工单-产品的行数
+                    row_count = len([r for r in self.io_df.iterrows() 
+                                     if str(r[1]['工单号']) == order and str(r[1]['产品编码']) == product])
+                    if row_count > 0:
+                        finished_lab_cost = summary['finished_lab'] / row_count
+                        finished_oh_cost = summary['finished_oh'] / row_count
+                    else:
+                        finished_lab_cost = summary['finished_lab']
+                        finished_oh_cost = summary['finished_oh']
+                
+                # 获取该行的完工/在产数量（直接取原始数据）
+                finished_q = row['产品完工数量']
+                wip_q = row['在产品数量']
+                
+                step_order_prod_mat_detail_list.append({
+                    '工单号': order,
+                    '产品编码': product,
+                    '材料编码': material,
+                    '材料领用数量': round(issue_qty, 2),
+                    'W_材料到工单': round(w_mat_to_order, 4),
+                    'W_工单到产品': round(w_order_to_prod, 4),
+                    '完工率': round(finished_ratio, 4),
+                    '完工数量': round(finished_q, 2),
+                    '在产品数量': round(wip_q, 2),
+                    '在产品材料费': round(wip_mat_cost, 2),
+                    '完工产品材料费': round(finished_mat_cost, 2),
+                    '完工产品直接人工': round(finished_lab_cost, 2),
+                    '完工产品制造费用': round(finished_oh_cost, 2),
+                    '成本小计': round(wip_mat_cost + finished_mat_cost + finished_lab_cost + finished_oh_cost, 2),
+                })
+            
             # 构建逐步结转法的成本明细
             step_detail_list = []
             for i, node in enumerate(self.all_nodes):
@@ -692,6 +946,7 @@ class CostCalculator:
             
             step_result = {
                 '逐步结转_工单明细': pd.DataFrame(step_order_detail_list),
+                '逐步结转_工单产品材料明细': pd.DataFrame(step_order_prod_mat_detail_list),
                 '逐步结转_成本明细': pd.DataFrame(step_detail_list),
             }
             
@@ -702,6 +957,7 @@ class CostCalculator:
         self.result = {
             '收发存': pd.DataFrame(result_list),
             '工单明细': pd.DataFrame(order_detail_list),
+            '工单产品材料明细': pd.DataFrame(order_prod_mat_detail_list),  # 新增：三维明细
             '成本明细': pd.DataFrame(detail_list),
             'nodes': self.all_nodes
         }
