@@ -101,7 +101,7 @@ class CostCalculator:
         self.performance_log['数据清洗'] = time.time() - start_time
         return True
     
-    def calculate(self, finished_df=None, finished_map=None, calculate_step_method=False):
+    def calculate(self, finished_df=None, finished_map=None, calculate_step_method=False, calculate_super_restoration=False):
         """执行核心成本计算（修正版）
         
         Parameters:
@@ -112,6 +112,8 @@ class CostCalculator:
             字段映射 {原列名: 标准名}
         calculate_step_method : bool, optional
             是否计算逐步结转法（平行结转法的补充），默认为False
+        calculate_super_restoration : bool, optional
+            是否计算超级成本还原，默认为False
         """
         from scipy import sparse
         from scipy.sparse.linalg import spsolve, splu
@@ -349,7 +351,177 @@ class CostCalculator:
         
         self.performance_log['矩阵求解'] = time.time() - t0
         self.performance_log['矩阵维度'] = n
- 
+        
+        # ==================== 超级成本还原（可选）====================
+        super_result = {}
+        if calculate_super_restoration:
+            t0 = time.time()
+            
+            # 一次遍历构建维度列表和 super_F 矩阵
+            super_dims = []
+            mat_dim_indices = []
+            loh_dim_indices = []
+            dim_info = []
+            dim_entries = []  # (dim_idx, node_idx, value)
+            
+            # 材料维度（期初）
+            for _, row in self.initial_df.iterrows():
+                mat = str(row['物料编码']).strip()
+                amt = row['期初金额']
+                if mat in self.node_index and amt > 0:
+                    idx = len(super_dims)
+                    super_dims.append(f"{mat}_期初")
+                    mat_dim_indices.append(idx)
+                    dim_entries.append((idx, self.node_index[mat], amt))
+                    dim_info.append({
+                        '维度名称': f"{mat}_期初", '维度类型': '期初',
+                        '来源节点': mat, '原始金额': amt,
+                        '说明': f'物料{mat}的期初金额'
+                    })
+            
+            # 材料维度（采购）
+            for _, row in self.purchase_df.iterrows():
+                mat = str(row['物料编码']).strip()
+                amt = row['采购金额']
+                if mat in self.node_index and amt > 0:
+                    idx = len(super_dims)
+                    super_dims.append(f"{mat}_采购")
+                    mat_dim_indices.append(idx)
+                    dim_entries.append((idx, self.node_index[mat], amt))
+                    dim_info.append({
+                        '维度名称': f"{mat}_采购", '维度类型': '采购',
+                        '来源节点': mat, '原始金额': amt,
+                        '说明': f'物料{mat}的采购金额'
+                    })
+            
+            # 工费维度（一次遍历 labor_df）
+            for _, row in self.labor_df.iterrows():
+                order = str(row['工单号']).strip()
+                lab = row['人工']
+                oh = row['制费']
+                if order in self.node_index:
+                    if lab > 0:
+                        idx = len(super_dims)
+                        super_dims.append(f"{order}_人工")
+                        loh_dim_indices.append(idx)
+                        dim_entries.append((idx, self.node_index[order], lab))
+                        dim_info.append({
+                            '维度名称': f"{order}_人工", '维度类型': '人工',
+                            '来源节点': order, '原始金额': lab,
+                            '说明': f'工单{order}的直接人工'
+                        })
+                    if oh > 0:
+                        idx = len(super_dims)
+                        super_dims.append(f"{order}_制费")
+                        loh_dim_indices.append(idx)
+                        dim_entries.append((idx, self.node_index[order], oh))
+                        dim_info.append({
+                            '维度名称': f"{order}_制费", '维度类型': '制费',
+                            '来源节点': order, '原始金额': oh,
+                            '说明': f'工单{order}的制造费用'
+                        })
+            
+            n_dims = len(super_dims)
+            
+            if n_dims > 0:
+                # 构建 super_F 矩阵
+                super_F = np.zeros((n, n_dims))
+                for d_idx, node_idx, val in dim_entries:
+                    super_F[node_idx, d_idx] = val
+                
+                # 批量求解
+                super_X = np.zeros((n, n_dims))
+                if len(mat_dim_indices) > 0:
+                    try:
+                        super_X[:, mat_dim_indices] = np.linalg.solve(A_mat, super_F[:, mat_dim_indices])
+                    except np.linalg.LinAlgError:
+                        super_X[:, mat_dim_indices] = np.linalg.pinv(A_mat) @ super_F[:, mat_dim_indices]
+                
+                if len(loh_dim_indices) > 0:
+                    try:
+                        super_X[:, loh_dim_indices] = np.linalg.solve(A_loh, super_F[:, loh_dim_indices])
+                    except np.linalg.LinAlgError:
+                        super_X[:, loh_dim_indices] = np.linalg.pinv(A_loh) @ super_F[:, loh_dim_indices]
+                
+                super_X = np.round(super_X, 4)
+                
+                # 向量化生成结果
+                mat_indices = [self.node_index[mat] for mat in self.material_nodes]
+                mat_total_cost = X[mat_indices].sum(axis=1)
+                dim_total = super_X.sum(axis=0)
+                mat_super_X = super_X[mat_indices, :]
+                
+                # 长格式明细
+                mask = np.abs(mat_super_X) >= 0.01
+                rows, cols = np.where(mask)
+                
+                long_format_rows = []
+                for i in range(len(rows)):
+                    r, c = rows[i], cols[i]
+                    mat = self.material_nodes[r]
+                    dim_name = super_dims[c]
+                    amt = float(mat_super_X[r, c])
+                    total_cost = float(mat_total_cost[r])
+                    dim_total_val = float(dim_total[c])
+                    
+                    product_ratio = amt / total_cost if total_cost > 0 else 0
+                    dim_ratio = amt / dim_total_val if dim_total_val > 0 else 0
+                    
+                    long_format_rows.append({
+                        '产品编码': mat,
+                        '成本维度': dim_name,
+                        '金额': round(amt, 2),
+                        '占产品总成本比例': f"{product_ratio:.2%}",
+                        '占该维度总金额比例': f"{dim_ratio:.2%}",
+                    })
+                
+                super_detail_long = pd.DataFrame(long_format_rows)
+                if not super_detail_long.empty:
+                    super_detail_long = super_detail_long.sort_values(['产品编码', '金额'], ascending=[True, False])
+                
+                # TopN 汇总：与长格式相同格式，但每个产品只保留前5大维度
+                if not super_detail_long.empty:
+                    super_topn_summary = super_detail_long.groupby('产品编码').head(5).reset_index(drop=True)
+                else:
+                    super_topn_summary = pd.DataFrame()
+                
+                # 维度定义表
+                super_dim_definition = pd.DataFrame(dim_info)
+                
+                # 验证
+                mat_super_sums = mat_super_X.sum(axis=1)
+                max_diff = float(np.max(np.abs(mat_super_sums - mat_total_cost)))
+                bad_mask = np.abs(mat_super_sums - mat_total_cost) > 1
+                bad_idx = np.where(bad_mask)[0]
+                
+                verification_rows = []
+                for r in bad_idx:
+                    verification_rows.append({
+                        '产品编码': self.material_nodes[r],
+                        '超级还原合计': round(float(mat_super_sums[r]), 2),
+                        '标准总成本': round(float(mat_total_cost[r]), 2),
+                        '差异': round(float(np.abs(mat_super_sums[r] - mat_total_cost[r])), 2)
+                    })
+                
+                super_verification = pd.DataFrame(verification_rows) if verification_rows else pd.DataFrame()
+                
+                super_result = {
+                    '超级还原_长格式明细': super_detail_long,
+                    '超级还原_TopN汇总': super_topn_summary,
+                    '超级还原_维度定义': super_dim_definition,
+                    '超级还原_验证差异': super_verification if not super_verification.empty else pd.DataFrame({'说明': ['所有产品勾稽验证通过，最大差异: {:.2f}'.format(max_diff)]}),
+                }
+                
+                self.performance_log['超级成本还原'] = time.time() - t0
+                self.performance_log['超级还原维度数'] = n_dims
+            else:
+                super_result = {
+                    '超级还原_长格式明细': pd.DataFrame(),
+                    '超级还原_TopN汇总': pd.DataFrame(),
+                    '超级还原_维度定义': pd.DataFrame({'说明': ['未找到任何成本维度数据']}),
+                    '超级还原_验证差异': pd.DataFrame(),
+                }
+        
         # Step 7: 计算WIP成本（公式：W × (1-D) × X_mat）
         # 注意：只用材料列 X_mat，工费不计算WIP
         t0 = time.time()
@@ -965,6 +1137,10 @@ class CostCalculator:
         # 合并逐步结转法结果（如果有）
         if step_result:
             self.result.update(step_result)
+        
+        # 合并超级成本还原结果（如果有）
+        if super_result:
+            self.result.update(super_result)
 
         with open(r'D:\桌面\公众号\成本核算系统\log\debug_cost.txt', 'w', encoding='utf-8') as f:
             f.write("=== 成本调试报告 ===\n")
@@ -1110,143 +1286,7 @@ class CostCalculator:
         restored_total = np.sum(X_restored, axis=1)
         original_total = S_total
         diff = np.abs(restored_total - original_total)
-        max_diff = np.max(diff) if len(diff) > 0 else 0
-        
-        # 保存调试信息
-        # debug_path = r'D:\桌面\公众号\成本核算系统\log\debug_cost_restoration.txt'
-        # with open(debug_path, 'w', encoding='utf-8') as f:
-        #     f.write("=" * 80 + "\n")
-        #     f.write("成本还原调试报告\n")
-        #     f.write("=" * 80 + "\n\n")
-            
-        #     f.write("【字段映射信息】\n")
-        #     f.write(f"  原始映射 (step_map): {step_map}\n")
-        #     f.write(f"  反转映射 (reverse_map): {reverse_map}\n")
-        #     f.write(f"  使用的列 - 物料编码: {col_code}, 料: {col_mat}\n\n")
-            
-        #     f.write("【输入数据检查】\n")
-        #     f.write(f"  step_cost_df 行数: {len(step_cost_df)}\n")
-        #     f.write(f"  成功匹配节点数: {match_count}\n")
-        #     f.write(f"  未匹配物料示例: {mismatch_rows}\n\n")
-            
-        #     f.write("【前10行输入数据（已匹配）】\n")
-        #     # if debug_rows:
-        #     #     f.write(f"{'物料':<15} {'类型':<8} {'料':<12} {'工':<12} {'费':<12} {'idx':<6}\n")
-        #     #     f.write("-" * 70 + "\n")
-        #     #     for r in debug_rows:
-        #     #         f.write(f"{r['物料']:<15} {r['类型']:<8} {r['料']:<12.4f} {r['工']:<12.4f} {r['费']:<12.4f} {r['idx']:<6}\n")
-        #     # f.write("\n")
-            
-        #     f.write("【输入数据汇总（节点向量）】\n")
-        #     f.write(f"  S_材料总和（逐步结转表） = {S_mat.sum():.4f}\n")
-        #     f.write(f"  F_人工总和（原始F矩阵） = {F_lab.sum():.4f}\n")
-        #     f.write(f"  F_制费总和（原始F矩阵） = {F_oh.sum():.4f}\n")
-        #     f.write(f"  S_总计总和 = {S_total.sum():.4f}\n\n")
-            
-        #     f.write("【W 矩阵详细检查】\n")
-        #     f.write(f"  W矩阵非零元素数: {np.count_nonzero(W_dense)}\n")
-        #     f.write(f"  W矩阵维度: {W_dense.shape}\n")
-            
-        #     # 检查W矩阵列和
-        #     col_sums = W_dense.sum(axis=0)
-        #     max_col_sum = col_sums.max()
-        #     max_col_idx = col_sums.argmax()
-        #     f.write(f"  W矩阵最大列和: {max_col_sum:.4f} (应 <= 1.0)\n")
-        #     f.write(f"  最大列和节点: {self.all_nodes[max_col_idx]}\n")
-            
-        #     # 列出列和>1的节点
-        #     cols_gt_1 = [(self.all_nodes[i], col_sums[i]) for i in range(n) if col_sums[i] > 1.01]
-        #     f.write(f"  列和>1的节点数: {len(cols_gt_1)}\n")
-        #     if cols_gt_1[:5]:
-        #         f.write(f"  列和>1的前5个节点: {cols_gt_1[:5]}\n")
-            
-        #     # 检查W矩阵行和
-        #     row_sums = W_dense.sum(axis=1)
-        #     max_row_sum = row_sums.max()
-        #     f.write(f"  W矩阵最大行和: {max_row_sum:.4f}\n")
-        #     f.write(f"\n")
-            
-        #     f.write("【D 矩阵检查】\n")
-        #     f.write(f"  D矩阵唯一值: {np.unique(D_mat)}\n")
-        #     d_non_ones = [(self.all_nodes[i], D_mat[i]) for i in range(n) if D_mat[i] != 1.0]
-        #     f.write(f"  D != 1.0 的节点数: {len(d_non_ones)}\n")
-        #     if d_non_ones[:5]:
-        #         f.write(f"  D != 1.0 的前5个: {d_non_ones[:5]}\n")
-        #     f.write(f"\n")
-            
-        #     f.write("【WD = W × D 矩阵检查】\n")
-        #     f.write(f"  WD非零元素数: {np.count_nonzero(WD)}\n")
-        #     wd_col_sums = WD.sum(axis=0)
-        #     f.write(f"  WD最大列和: {wd_col_sums.max():.4f}\n")
-        #     wd_row_sums = WD.sum(axis=1)
-        #     f.write(f"  WD最大行和: {wd_row_sums.max():.4f}\n")
-        #     f.write(f"\n")
-            
-        #     f.write("【A = I - WD 矩阵检查】\n")
-        #     f.write(f"  A条件数: {np.linalg.cond(A):.4e}\n")
-        #     # 检查A的对角线
-        #     a_diag = np.diag(A)
-        #     f.write(f"  A对角线均值: {a_diag.mean():.4f} (应接近1.0)\n")
-        #     f.write(f"  A对角线范围: [{a_diag.min():.4f}, {a_diag.max():.4f}]\n")
-        #     f.write(f"\n")
-            
-        #     f.write("【F 矩阵（原始外部投入）检查】\n")
-        #     f.write(f"  F_人工非零数: {np.count_nonzero(F_lab)}\n")
-        #     f.write(f"  F_制费非零数: {np.count_nonzero(F_oh)}\n")
-        #     f.write(f"  F_人工总和: {F_lab.sum():.4f}\n")
-        #     f.write(f"  F_制费总和: {F_oh.sum():.4f}\n")
-            
-        #     # 找出人工和制费最大的前5个节点（应该只有工单）
-        #     top_lab_idx = np.argsort(F_lab)[-5:][::-1]
-        #     top_oh_idx = np.argsort(F_oh)[-5:][::-1]
-        #     f.write(f"\n  原始人工费Top5（应只有工单）:\n")
-        #     for idx in top_lab_idx:
-        #         if F_lab[idx] > 0:
-        #             node_type = '工单' if self.all_nodes[idx] in self.order_nodes else '物料'
-        #             f.write(f"    {self.all_nodes[idx]} ({node_type}): {F_lab[idx]:.4f}\n")
-        #     f.write(f"\n  原始制费Top5（应只有工单）:\n")
-        #     for idx in top_oh_idx:
-        #         if F_oh[idx] > 0:
-        #             node_type = '工单' if self.all_nodes[idx] in self.order_nodes else '物料'
-        #             f.write(f"    {self.all_nodes[idx]} ({node_type}): {F_oh[idx]:.4f}\n")
-        #     f.write(f"\n")
-            
-        #     f.write("【输出数据汇总】\n")
-        #     f.write(f"  X_材料总和 = {X_true_mat.sum():.4f}\n")
-        #     f.write(f"  X_人工总和 = {X_true_lab.sum():.4f}\n")
-        #     f.write(f"  X_制费总和 = {X_true_oh.sum():.4f}\n")
-        #     f.write(f"  X_还原总计 = {X_restored.sum():.4f}\n\n")
-            
-        #     f.write(f"【勾稽检查】最大差异 = {max_diff:.4f}\n\n")
-            
-        #     f.write("【求解过程检查】\n")
-        #     f.write(f"  理论上: X = (I - WD)^(-1) × F\n")
-        #     f.write(f"  即: X - WD × X = F\n")
-        #     f.write(f"  验证: X_人工 - WD @ X_人工 应接近 F_人工\n\n")
-            
-        #     # 验证求解结果
-        #     verify_lab = X_true_lab - WD @ X_true_lab
-        #     verify_oh = X_true_oh - WD @ X_true_oh
-        #     f.write(f"  X_人工 - WD @ X_人工 的总和: {verify_lab.sum():.4f}\n")
-        #     f.write(f"  F_人工总和: {F_lab.sum():.4f}\n")
-        #     f.write(f"  人工验证差异: {abs(verify_lab.sum() - F_lab.sum()):.4f}\n\n")
-            
-        #     f.write(f"  X_制费 - WD @ X_制费 的总和: {verify_oh.sum():.4f}\n")
-        #     f.write(f"  F_制费总和: {F_oh.sum():.4f}\n")
-        #     f.write(f"  制费验证差异: {abs(verify_oh.sum() - F_oh.sum()):.4f}\n\n")
-            
-        #     f.write("【关键节点对比 - 前20个】\n")
-        #     f.write(f"{'节点':<15} {'类型':<8} {'S_料':<12} {'F_工':<12} {'F_费':<12} {'X_料':<12} {'X_工':<12} {'X_费':<12}\n")
-        #     f.write("-" * 100 + "\n")
-            
-        #     count = 0
-        #     for node in self.all_nodes:
-        #         idx = self.node_index[node]
-        #         node_type = '工单' if node in self.order_nodes else '物料'
-        #         f.write(f"{node:<15} {node_type:<8} {S_mat[idx]:<12.4f} {F_lab[idx]:<12.4f} {F_oh[idx]:<12.4f} {X_true_mat[idx]:<12.4f} {X_true_lab[idx]:<12.4f} {X_true_oh[idx]:<12.4f}\n")
-        #         count += 1
-        #         if count >= 20:
-        #             break
+        max_diff = np.max(diff) if len(diff) > 0 else 0       
         
         if max_diff > 1:  # 允许1元误差
             print(f"警告：成本还原不勾稽！最大差异: {max_diff:.2f}")

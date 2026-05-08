@@ -1036,7 +1036,7 @@ def render_cost_accounting():
         return
     
     # 计算选项
-    col_opt1, col_opt2 = st.columns([1, 2])
+    col_opt1, col_opt2, col_opt3 = st.columns([1, 1, 1])
     with col_opt1:
         calculate_step_method = st.checkbox(
             "📊 计算逐步结转法", 
@@ -1044,7 +1044,13 @@ def render_cost_accounting():
             help="逐步结转法下，人工制费按(I+W×D)×F计算，材料=总成本-人工-制费"
         )
     with col_opt2:
-        st.caption("💡 默认使用平行结转法（成本还原）。勾选后将额外计算逐步结转法结果")
+        calculate_super_restoration = st.checkbox(
+            "🔬 超级成本还原",
+            value=False,
+            help="将每个原始成本来源（期初/采购/人工/制费）作为独立维度构造F矩阵，精确追踪每个维度对最终产品的贡献"
+        )
+    with col_opt3:
+        st.caption("💡 默认使用平行结转法。勾选后将额外计算对应结果")
     
     if st.button("🚀 执行成本核算", type="primary", use_container_width=True):
         with st.spinner("正在计算..."):
@@ -1069,9 +1075,9 @@ def render_cost_accounting():
                 if fin_file and fin_map:
                     fin_file.seek(0)
                     finished_df = pd.read_excel(fin_file)
-                    result = calc.calculate(finished_df, fin_map, calculate_step_method=calculate_step_method)
+                    result = calc.calculate(finished_df, fin_map, calculate_step_method=calculate_step_method, calculate_super_restoration=calculate_super_restoration)
                 else:
-                    result = calc.calculate(calculate_step_method=calculate_step_method)
+                    result = calc.calculate(calculate_step_method=calculate_step_method, calculate_super_restoration=calculate_super_restoration)
                 total_time = time.time() - start
                 
                 # 保存结果到 session state - 包含数据和计算器实例
@@ -1105,10 +1111,21 @@ def render_cost_accounting():
         # 性能指标
         render_time_metrics(perf, total_time)
         
-        # 结果标签页 - 根据是否有逐步结转法结果动态调整
+        # 结果标签页 - 根据是否有逐步结转法/超级成本还原结果动态调整
         has_step_result = '逐步结转_工单明细' in result and '逐步结转_成本明细' in result
+        has_super_result = '超级还原_长格式明细' in result
         
-        if has_step_result:
+        if has_step_result and has_super_result:
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                "📋 收发存汇总", 
+                "📊 工单投入产出明细", 
+                "📈 成本明细",
+                "🕸️ 材料流向图",
+                "⛓️ 边表与路径表",
+                "🔄 逐步结转法",
+                "🔬 超级成本还原"
+            ])
+        elif has_step_result:
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
                 "📋 收发存汇总", 
                 "📊 工单投入产出明细", 
@@ -1116,6 +1133,15 @@ def render_cost_accounting():
                 "🕸️ 材料流向图",
                 "⛓️ 边表与路径表",
                 "🔄 逐步结转法"
+            ])
+        elif has_super_result:
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                "📋 收发存汇总", 
+                "📊 工单投入产出明细", 
+                "📈 成本明细",
+                "🕸️ 材料流向图",
+                "⛓️ 边表与路径表",
+                "🔬 超级成本还原"
             ])
         else:
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -1219,9 +1245,10 @@ def render_cost_accounting():
                 else:
                     st.info("暂无路径数据")
         
-        # Tab 6: 逐步结转法结果（如果有）
+        # Tab 6/7: 逐步结转法结果（如果有）
         if has_step_result:
-            with tab6:
+            step_tab = tab6  # 逐步结转法固定用 tab6
+            with step_tab:
                 st.markdown("##### 逐步结转法计算结果")
                 st.info("""
                 **逐步结转法说明**：
@@ -1250,6 +1277,66 @@ def render_cost_accounting():
                     st.dataframe(result['逐步结转_成本明细'].sort_values('总成本', ascending=False),
                                 use_container_width=True, height=500)
         
+        # Tab 6/7: 超级成本还原结果（如果有）
+        if has_super_result:
+            super_tab = tab7 if has_step_result else tab6
+            with super_tab:
+                st.markdown("##### 🔬 超级成本还原")
+                st.info("""
+                **超级成本还原说明**：
+                - 将每个原始成本来源（期初/采购/人工/制费）作为独立维度构造F矩阵
+                - 利用矩阵乘法的线性性质：X_i = (I-WD)^(-1) × F_i，各维度独立求解
+                - 结果可精确追踪每个原始成本维度对最终产品的贡献金额
+                - 长格式表展示每个产品在每个维度上的成本，TopN汇总展示各产品的前5大成本来源
+                """)
+                
+                # 统计信息
+                n_dims = perf.get('超级还原维度数', 0)
+                st.caption(f"成本维度总数: **{n_dims}** 个")
+                
+                sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
+                    "📋 长格式明细", 
+                    "🏆 TopN汇总", 
+                    "📖 维度定义",
+                    "✅ 验证差异"
+                ])
+                
+                with sub_tab1:
+                    st.markdown("##### 超级成本还原 - 长格式明细")
+                    st.caption("每行一个(产品, 维度)组合，易于筛选和排序")
+                    if '超级还原_长格式明细' in result and not result['超级还原_长格式明细'].empty:
+                        st.dataframe(result['超级还原_长格式明细'],
+                                    use_container_width=True, height=500)
+                    else:
+                        st.info("暂无超级成本还原明细数据")
+                
+                with sub_tab2:
+                    st.markdown("##### 超级成本还原 - TopN汇总")
+                    st.caption("每个产品的前5大成本来源，便于快速浏览")
+                    if '超级还原_TopN汇总' in result and not result['超级还原_TopN汇总'].empty:
+                        st.dataframe(result['超级还原_TopN汇总'],
+                                    use_container_width=True, height=500)
+                    else:
+                        st.info("暂无TopN汇总数据")
+                
+                with sub_tab3:
+                    st.markdown("##### 超级成本还原 - 维度定义")
+                    st.caption("每个成本维度的来源和原始金额")
+                    if '超级还原_维度定义' in result and not result['超级还原_维度定义'].empty:
+                        st.dataframe(result['超级还原_维度定义'],
+                                    use_container_width=True, height=400)
+                    else:
+                        st.info("暂无维度定义数据")
+                
+                with sub_tab4:
+                    st.markdown("##### 超级成本还原 - 验证差异")
+                    st.caption("验证：每个产品所有维度之和 ≈ 标准总成本")
+                    if '超级还原_验证差异' in result and not result['超级还原_验证差异'].empty:
+                        st.dataframe(result['超级还原_验证差异'],
+                                    use_container_width=True, height=300)
+                    else:
+                        st.info("暂无验证数据")
+        
         # 下载按钮
         st.divider()
         
@@ -1266,6 +1353,12 @@ def render_cost_accounting():
             export_sheets['逐步结转_投入产出汇总表'] = result['逐步结转_工单明细']
             export_sheets['逐步结转_投入产出明细表'] = result.get('逐步结转_工单产品材料明细', pd.DataFrame())
             export_sheets['逐步结转_成本明细'] = result['逐步结转_成本明细']
+        
+        # 添加超级成本还原结果（如果有）—— 维度定义不导出，仅前端展示
+        if has_super_result:
+            export_sheets['超级还原_长格式明细'] = result.get('超级还原_长格式明细', pd.DataFrame())
+            export_sheets['超级还原_TopN汇总'] = result.get('超级还原_TopN汇总', pd.DataFrame())
+            export_sheets['超级还原_验证差异'] = result.get('超级还原_验证差异', pd.DataFrame())
         
         # 添加边表和路径表
         calc = st.session_state.cost_calc
