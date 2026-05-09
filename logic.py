@@ -11,6 +11,7 @@ class CostCalculator:
         self.purchase_df = None
         self.io_df = None
         self.labor_df = None
+        self.sales_df = None  # 销售数据
         self.result = None
         self.performance_log = {}
         
@@ -23,9 +24,11 @@ class CostCalculator:
         self.order_nodes = None
         self.node_index = None
         self.X_total = None  # 总成本矩阵
+        self.available_qty = None  # 可供发出数量（W矩阵用，材料完工口径）
+        self.sales_available_qty = None  # 可供发出数量（销售用，产品完工口径）
         
-    def load_data(self, initial_file, purchase_file, io_file, labor_file,
-                  initial_map, purchase_map, io_map, labor_map):
+    def load_data(self, initial_file, purchase_file, io_file, labor_file, sales_file=None,
+                  initial_map=None, purchase_map=None, io_map=None, labor_map=None, sales_map=None):
         """加载并清洗数据"""
         start_time = time.time()
         
@@ -97,6 +100,21 @@ class CostCalculator:
             self.labor_df = df_lab.groupby('工单号')[['人工', '制费']].sum().reset_index()
         else:
             self.labor_df = pd.DataFrame(columns=['工单号', '人工', '制费'])
+        
+        # 销售数据（可选）
+        has_sales = (sales_file is not None and 
+                    hasattr(sales_file, 'read') and 
+                    sales_map and 
+                    len(sales_map) > 0)
+        if has_sales:
+            df_sales = pd.read_excel(sales_file)
+            df_sales = df_sales.rename(columns=sales_map)
+            df_sales['物料编码'] = df_sales['物料编码'].astype(str).str.strip()
+            df_sales['销售数量'] = pd.to_numeric(df_sales['销售数量'], errors='coerce').fillna(0)
+            df_sales['销售批次号'] = df_sales['销售批次号'].astype(str).str.strip()
+            self.sales_df = df_sales.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+        else:
+            self.sales_df = pd.DataFrame(columns=['物料编码', '销售批次号', '销售数量'])
         
         self.performance_log['数据清洗'] = time.time() - start_time
         return True
@@ -274,6 +292,15 @@ class CostCalculator:
         
         self.performance_log['构建矩阵'] = time.time() - t0
         
+        # 保存可供发出数量
+        self.available_qty = available_qty  # W矩阵用：期初 + 采购 + 材料完工数量
+        
+        # 销售用可供发出数量：期初 + 采购 + 产品完工数量（报表口径）
+        sales_available_qty = {}
+        for mat in self.material_nodes:
+            sales_available_qty[mat] = init_qty[mat] + pur_qty[mat] + finished_qty_for_report[mat]
+        self.sales_available_qty = sales_available_qty
+        
         # Step 4: 构建阀门矩阵D
         D_mat = np.ones(n)
         D_loh = np.ones(n)
@@ -351,6 +378,86 @@ class CostCalculator:
         
         self.performance_log['矩阵求解'] = time.time() - t0
         self.performance_log['矩阵维度'] = n
+        
+        # ==================== 销售成本计算（如果有销售数据）====================
+        sales_cost_df = pd.DataFrame()
+        if not self.sales_df.empty:
+            t0 = time.time()
+            
+            # 按物料汇总销售数量
+            mat_sales = self.sales_df.groupby('物料编码')['销售数量'].sum().to_dict()
+            batch_sales = self.sales_df  # 已按(物料, 批次)聚合
+            
+            # 构建 Sale 矩阵（N×N 对角阵）
+            S = np.zeros((n, n))
+            for mat, sales_qty in mat_sales.items():
+                if mat in self.node_index:
+                    idx = self.node_index[mat]
+                    avail = self.sales_available_qty.get(mat, 0)
+                    if avail > 0:
+                        S[idx, idx] = sales_qty / avail
+            
+            # 构建 Batch 矩阵（M×N）
+            batch_list = sorted(batch_sales['销售批次号'].unique())
+            m = len(batch_list)
+            batch_index = {b: i for i, b in enumerate(batch_list)}
+            
+            B = np.zeros((m, n))
+            for _, row in batch_sales.iterrows():
+                mat = str(row['物料编码'])
+                batch = str(row['销售批次号'])
+                qty = row['销售数量']
+                if mat in self.node_index and batch in batch_index:
+                    mat_idx = self.node_index[mat]
+                    batch_idx = batch_index[batch]
+                    total_sales = mat_sales.get(mat, 0)
+                    if total_sales > 0:
+                        B[batch_idx, mat_idx] = qty / total_sales
+            
+            # 计算 C = B × S × X
+            SX = S.dot(X)  # N×3
+            C = B.dot(SX)  # M×3
+            
+            # 构建销售成本结果
+            sales_rows = []
+            for _, row in batch_sales.iterrows():
+                mat = str(row['物料编码'])
+                batch = str(row['销售批次号'])
+                qty = row['销售数量']
+                if mat not in self.node_index:
+                    continue
+                mat_idx = self.node_index[mat]
+                batch_idx = batch_index.get(batch)
+                if batch_idx is None:
+                    continue
+                
+                avail = self.sales_available_qty.get(mat, 0)
+                sales_ratio = S[mat_idx, mat_idx]
+                batch_ratio = B[batch_idx, mat_idx]
+                
+                cost_mat = batch_ratio * SX[mat_idx, 0]
+                cost_lab = batch_ratio * SX[mat_idx, 1]
+                cost_oh = batch_ratio * SX[mat_idx, 2]
+                cost_total = cost_mat + cost_lab + cost_oh
+                
+                sales_rows.append({
+                    '销售批次号': batch,
+                    '物料编码': mat,
+                    '销售数量': round(qty, 2),
+                    '可供发出数量': round(avail, 2),
+                    '销售占比': f"{sales_ratio:.2%}",
+                    '批次占物料销售比': f"{batch_ratio:.2%}",
+                    '销售成本_料': round(cost_mat, 2),
+                    '销售成本_工': round(cost_lab, 2),
+                    '销售成本_费': round(cost_oh, 2),
+                    '销售成本_合计': round(cost_total, 2),
+                })
+            
+            sales_cost_df = pd.DataFrame(sales_rows)
+            if not sales_cost_df.empty:
+                sales_cost_df = sales_cost_df.sort_values(['销售批次号', '物料编码'])
+            
+            self.performance_log['销售成本计算'] = time.time() - t0
         
         # ==================== 超级成本还原（可选）====================
         super_result = {}
@@ -448,14 +555,19 @@ class CostCalculator:
                 # 向量化生成结果
                 mat_indices = [self.node_index[mat] for mat in self.material_nodes]
                 mat_total_cost = X[mat_indices].sum(axis=1)
-                dim_total = super_X.sum(axis=0)
                 mat_super_X = super_X[mat_indices, :]
+                
+                # 【关键修复】dim_total 只包含物料节点（最终产品），排除工单节点
+                dim_total = mat_super_X.sum(axis=0)
                 
                 # 长格式明细
                 mask = np.abs(mat_super_X) >= 0.01
                 rows, cols = np.where(mask)
                 
                 long_format_rows = []
+                # 预计算每个(产品, 维度)的维度占比，供销售成本表复用
+                product_dim_ratios = {}  # {(mat, dim_name): dim_ratio}
+                
                 for i in range(len(rows)):
                     r, c = rows[i], cols[i]
                     mat = self.material_nodes[r]
@@ -466,6 +578,7 @@ class CostCalculator:
                     
                     product_ratio = amt / total_cost if total_cost > 0 else 0
                     dim_ratio = amt / dim_total_val if dim_total_val > 0 else 0
+                    product_dim_ratios[(mat, dim_name)] = dim_ratio
                     
                     long_format_rows.append({
                         '产品编码': mat,
@@ -478,6 +591,8 @@ class CostCalculator:
                 super_detail_long = pd.DataFrame(long_format_rows)
                 if not super_detail_long.empty:
                     super_detail_long = super_detail_long.sort_values(['产品编码', '金额'], ascending=[True, False])
+                    # 添加成本序号（按产品分组，从1开始）
+                    super_detail_long.insert(1, '成本序号', super_detail_long.groupby('产品编码').cumcount() + 1)
                 
                 # TopN 汇总：与长格式相同格式，但每个产品只保留前5大维度
                 if not super_detail_long.empty:
@@ -505,18 +620,76 @@ class CostCalculator:
                 
                 super_verification = pd.DataFrame(verification_rows) if verification_rows else pd.DataFrame()
                 
+                # ========== 销售成本的超级还原（如果有销售数据）==========
+                sales_super_long = pd.DataFrame()
+                if not self.sales_df.empty and 'S' in dir() and 'B' in dir():
+                    # 利用已计算的 S、B、super_X、super_dims
+                    # 计算每个 (批次, 物料, 维度) 的销售成本
+                    sales_super_rows = []
+                    
+                    # 预计算所有 (批次, 物料, 维度) 的金额
+                    batch_dim_data = []  # [(batch, mat, dim_name, amt), ...]
+                    
+                    for _, row in batch_sales.iterrows():
+                        mat = str(row['物料编码'])
+                        batch = str(row['销售批次号'])
+                        if mat not in self.node_index or batch not in batch_index:
+                            continue
+                        mat_idx = self.node_index[mat]
+                        batch_idx = batch_index[batch]
+                        batch_ratio = B[batch_idx, mat_idx]
+                        sales_ratio = S[mat_idx, mat_idx]
+                        
+                        for d_idx, dim_name in enumerate(super_dims):
+                            amt = batch_ratio * sales_ratio * super_X[mat_idx, d_idx]
+                            if abs(amt) >= 0.01:
+                                batch_dim_data.append((batch, mat, dim_name, amt))
+                    
+                    # 计算批次总成本
+                    batch_totals = {}
+                    for batch, mat, dim_name, amt in batch_dim_data:
+                        if batch not in batch_totals:
+                            batch_totals[batch] = 0
+                        batch_totals[batch] += amt
+                    
+                    # 构建结果——维度占比直接复用完工成本表（二者应一致）
+                    for batch, mat, dim_name, amt in batch_dim_data:
+                        batch_total = batch_totals.get(batch, 1)
+                        batch_ratio_pct = amt / batch_total if batch_total > 0 else 0
+                        # 【关键修复】复用完工成本表的维度占比
+                        dim_ratio_pct = product_dim_ratios.get((mat, dim_name), 0)
+                        
+                        sales_super_rows.append({
+                            '销售批次号': batch,
+                            '产品编码': mat,
+                            '成本维度': dim_name,
+                            '金额': round(amt, 2),
+                            '占批次总成本比例': f"{batch_ratio_pct:.2%}",
+                            '占该维度总金额比例': f"{dim_ratio_pct:.2%}",
+                        })
+                    
+                    if sales_super_rows:
+                        sales_super_long = pd.DataFrame(sales_super_rows)
+                        sales_super_long = sales_super_long.sort_values(['销售批次号', '金额'], ascending=[True, False])
+                        # 添加成本序号（按销售批次号+产品编码分组，从1开始）
+                        sales_super_long.insert(2, '成本序号', sales_super_long.groupby(['销售批次号', '产品编码']).cumcount() + 1)
+                
                 super_result = {
-                    '超级还原_长格式明细': super_detail_long,
+                    '超级还原_完工成本': super_detail_long,
                     '超级还原_TopN汇总': super_topn_summary,
                     '超级还原_维度定义': super_dim_definition,
                     '超级还原_验证差异': super_verification if not super_verification.empty else pd.DataFrame({'说明': ['所有产品勾稽验证通过，最大差异: {:.2f}'.format(max_diff)]}),
                 }
                 
+                # 如果有销售成本的超级还原，加入结果
+                if not sales_super_long.empty:
+                    super_result['超级还原_销售成本'] = sales_super_long
+                
                 self.performance_log['超级成本还原'] = time.time() - t0
                 self.performance_log['超级还原维度数'] = n_dims
             else:
                 super_result = {
-                    '超级还原_长格式明细': pd.DataFrame(),
+                    '超级还原_完工成本': pd.DataFrame(),
                     '超级还原_TopN汇总': pd.DataFrame(),
                     '超级还原_维度定义': pd.DataFrame({'说明': ['未找到任何成本维度数据']}),
                     '超级还原_验证差异': pd.DataFrame(),
@@ -540,6 +713,11 @@ class CostCalculator:
         # Step 8: 结果整理
         # 8.1 收发存汇总表
         issue_summary = self.io_df.groupby('材料编码')['材料领用数量'].sum().to_dict()
+        
+        # 按物料汇总销售数量（如果有销售数据）
+        sales_summary = {}
+        if not self.sales_df.empty:
+            sales_summary = self.sales_df.groupby('物料编码')['销售数量'].sum().to_dict()
         
         result_list = []
         for mat in self.material_nodes:
@@ -570,7 +748,8 @@ class CostCalculator:
             # 收入金额 = 完工产品成本 - 期初金额（剔除以前期间的成本）
             receipt_amt = finished_cost - init_a
             
-            issue_q = issue_summary.get(mat, 0)
+            # 发出数量 = 生产领用 + 销售出库
+            issue_q = issue_summary.get(mat, 0) + sales_summary.get(mat, 0)
             
             # 总数量 = 期初 + 收入
             total_q = init_q + receipt_qty
@@ -586,6 +765,8 @@ class CostCalculator:
                 '本期完工数量': round(fin_q, 4),
                 '本期收入数量': round(receipt_qty, 4),
                 '本期收入金额': round(receipt_amt, 4),
+                '本月领用数量': round(issue_summary.get(mat, 0), 4),
+                '本月销售数量': round(sales_summary.get(mat, 0), 4),
                 '本月发出数量': round(issue_q, 4),
                 '发出单价': round(unit_price, 4),
                 '发出金额': round(issue_amt, 4),
@@ -1141,6 +1322,10 @@ class CostCalculator:
         # 合并超级成本还原结果（如果有）
         if super_result:
             self.result.update(super_result)
+        
+        # 合并销售成本结果（如果有）
+        if not sales_cost_df.empty:
+            self.result['销售成本明细'] = sales_cost_df
 
         with open(r'D:\桌面\公众号\成本核算系统\log\debug_cost.txt', 'w', encoding='utf-8') as f:
             f.write("=== 成本调试报告 ===\n")
@@ -1183,6 +1368,128 @@ class CostCalculator:
                         f.write(f"{self.all_nodes[i]}: {diag[i]:.4f}\n")
 
         return self.result
+    
+    def calculate_sales_cost(self, sales_df, sales_map):
+        """计算销售成本
+        
+        公式: C = B × S × X
+        
+        Parameters:
+        -----------
+        sales_df : DataFrame
+            销售数据，包含物料编码、销售数量、销售批次号
+        sales_map : dict
+            字段映射 {原列名: 标准名}
+        
+        Returns:
+        --------
+        pd.DataFrame
+            销售成本明细表（每行一个批次+物料组合）
+        """
+        if self.X_total is None:
+            raise ValueError("请先执行成本核算以获取X矩阵")
+        
+        if self.available_qty is None:
+            raise ValueError("可供发出数量未计算，请重新执行成本核算")
+        
+        # 读取并清洗销售数据
+        df = sales_df.rename(columns=sales_map)
+        df['物料编码'] = df['物料编码'].astype(str).str.strip()
+        df['销售数量'] = pd.to_numeric(df['销售数量'], errors='coerce').fillna(0)
+        df['销售批次号'] = df['销售批次号'].astype(str).str.strip()
+        
+        # 按物料汇总销售数量
+        mat_sales = df.groupby('物料编码')['销售数量'].sum().to_dict()
+        
+        # 按(物料, 批次)汇总销售数量
+        batch_sales = df.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+        
+        n = len(self.all_nodes)
+        
+        # ========== 构建 Sale 矩阵（N×N 对角阵）==========
+        S = np.zeros((n, n))
+        for mat, sales_qty in mat_sales.items():
+            if mat in self.node_index:
+                idx = self.node_index[mat]
+                avail = self.available_qty.get(mat, 0)
+                if avail > 0:
+                    S[idx, idx] = sales_qty / avail
+                else:
+                    S[idx, idx] = 0
+        
+        # ========== 构建 Batch 矩阵（M×N）==========
+        batch_list = sorted(batch_sales['销售批次号'].unique())
+        m = len(batch_list)
+        batch_index = {b: i for i, b in enumerate(batch_list)}
+        
+        B = np.zeros((m, n))
+        for _, row in batch_sales.iterrows():
+            mat = str(row['物料编码'])
+            batch = str(row['销售批次号'])
+            qty = row['销售数量']
+            
+            if mat in self.node_index and batch in batch_index:
+                mat_idx = self.node_index[mat]
+                batch_idx = batch_index[batch]
+                total_sales = mat_sales.get(mat, 0)
+                if total_sales > 0:
+                    B[batch_idx, mat_idx] = qty / total_sales
+        
+        # ========== 计算 C = B × S × X ==========
+        # S × X: N×3
+        SX = S.dot(self.X_total)
+        
+        # B × SX: M×3
+        C = B.dot(SX)
+        
+        # ========== 构建结果 DataFrame ==========
+        result_list = []
+        for _, row in batch_sales.iterrows():
+            mat = str(row['物料编码'])
+            batch = str(row['销售批次号'])
+            qty = row['销售数量']
+            
+            if mat not in self.node_index:
+                continue
+            
+            mat_idx = self.node_index[mat]
+            batch_idx = batch_index.get(batch)
+            if batch_idx is None:
+                continue
+            
+            avail = self.available_qty.get(mat, 0)
+            total_sales = mat_sales.get(mat, 0)
+            sales_ratio = S[mat_idx, mat_idx]  # 销售占比 = 总销售 / 可供发出
+            batch_ratio = B[batch_idx, mat_idx]  # 批次占比 = 批次销售 / 总销售
+            
+            # 从 C 矩阵取该批次的成本（如果同一批次有多个物料，需要按物料拆分）
+            # 实际上 C[batch_idx] 是该批次所有物料的成本之和
+            # 所以按 batch_ratio / 该批次在所有物料上的占比 来拆分
+            # 更简单：直接用 batch_ratio * SX[mat_idx]
+            cost_mat = batch_ratio * SX[mat_idx, 0]
+            cost_lab = batch_ratio * SX[mat_idx, 1]
+            cost_oh = batch_ratio * SX[mat_idx, 2]
+            cost_total = cost_mat + cost_lab + cost_oh
+            
+            result_list.append({
+                '销售批次号': batch,
+                '物料编码': mat,
+                '销售数量': round(qty, 2),
+                '可供发出数量': round(avail, 2),
+                '销售占比': f"{sales_ratio:.2%}",
+                '批次占物料销售比': f"{batch_ratio:.2%}",
+                '销售成本_料': round(cost_mat, 2),
+                '销售成本_工': round(cost_lab, 2),
+                '销售成本_费': round(cost_oh, 2),
+                '销售成本_合计': round(cost_total, 2),
+            })
+        
+        # 按批次号排序
+        result_df = pd.DataFrame(result_list)
+        if not result_df.empty:
+            result_df = result_df.sort_values(['销售批次号', '物料编码'])
+        
+        return result_df
     
     def calculate_cost_restoration(self, step_cost_df, step_map):
         """成本还原计算

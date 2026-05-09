@@ -160,6 +160,20 @@ def smart_match(columns, file_type):
                 (r'间接费用', 7), (r'制造成本', 6)
             ]
         },
+        '销售': {
+            '物料编码': [
+                (r'物料.*编码$', 10), (r'产品.*编码$', 10), (r'料号$', 9), 
+                (r'品号$', 8), (r'存货编码$', 7), (r'编码$', 5)
+            ],
+            '销售数量': [
+                (r'销售.*数量$', 10), (r'出库.*数量$', 9), (r'发货.*数量$', 8),
+                (r'数量$', 5), (r'出库数$', 7)
+            ],
+            '销售批次号': [
+                (r'批次号?$', 10), (r'出库单号$', 9), (r'订单号$', 8),
+                (r'签收单号$', 8), (r'单号$', 6), (r'批次$', 7)
+            ]
+        },
         '逐步结转': {
             '物料编码': [
                 (r'物料.*编码$', 10), (r'产品.*编码$', 10), (r'料号$', 9), 
@@ -242,6 +256,8 @@ def detect_file_type(filename):
         return 'io', '投入产出明细'
     elif any(kw in name_lower for kw in ['期初', 'initial', '期初结存']):
         return 'initial', '期初结存'
+    elif any(kw in name_lower for kw in ['销售', '出库', '发货', 'sales', 'sell']):
+        return 'sales', '销售数据'
     elif any(kw in name_lower for kw in ['人工', '制费', '费用', 'labor', 'cost']):
         return 'labor', '工单人工制费'
     return None, None
@@ -802,6 +818,9 @@ def init_session_state():
         'field_mappings': {},
         'step_cost_file': None,
         'step_cost_mapping': None,
+        'sales_data': None,
+        'sales_mapping': None,
+        'sales_result': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -942,6 +961,7 @@ def render_cost_accounting():
         ('finished', '🔴 产成品入库明细', '入库', True),  # 新增：产成品入库
         ('initial', '⚪ 期初结存', '期初', False),
         ('labor', '⚪ 工单人工制费', '工单费用', False),
+        ('sales', '🚚 销售数据', '销售', False),  # 新增：销售数据
     ]
     
     uploaded = {}
@@ -1063,10 +1083,12 @@ def render_cost_accounting():
                     uploaded['purchase'],
                     uploaded['io'],
                     uploaded.get('labor'),
+                    uploaded.get('sales'),
                     mappings.get('initial', {}),
                     mappings.get('purchase', {}),
                     mappings.get('io', {}),
-                    mappings.get('labor', {})
+                    mappings.get('labor', {}),
+                    mappings.get('sales', {})
                 )
                 
                 # 如果有产成品入库明细，传入calculate
@@ -1111,46 +1133,39 @@ def render_cost_accounting():
         # 性能指标
         render_time_metrics(perf, total_time)
         
-        # 结果标签页 - 根据是否有逐步结转法/超级成本还原结果动态调整
+        # 结果标签页 - 动态构建
         has_step_result = '逐步结转_工单明细' in result and '逐步结转_成本明细' in result
-        has_super_result = '超级还原_长格式明细' in result
+        has_super_result = '超级还原_完工成本' in result
+        has_sales_result = '销售成本明细' in result
         
-        if has_step_result and has_super_result:
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-                "📋 收发存汇总", 
-                "📊 工单投入产出明细", 
-                "📈 成本明细",
-                "🕸️ 材料流向图",
-                "⛓️ 边表与路径表",
-                "🔄 逐步结转法",
-                "🔬 超级成本还原"
-            ])
-        elif has_step_result:
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-                "📋 收发存汇总", 
-                "📊 工单投入产出明细", 
-                "📈 成本明细",
-                "🕸️ 材料流向图",
-                "⛓️ 边表与路径表",
-                "🔄 逐步结转法"
-            ])
-        elif has_super_result:
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-                "📋 收发存汇总", 
-                "📊 工单投入产出明细", 
-                "📈 成本明细",
-                "🕸️ 材料流向图",
-                "⛓️ 边表与路径表",
-                "🔬 超级成本还原"
-            ])
-        else:
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "📋 收发存汇总", 
-                "📊 工单投入产出明细", 
-                "📈 成本明细",
-                "🕸️ 材料流向图",
-                "⛓️ 边表与路径表"
-            ])
+        tab_labels = [
+            "📋 收发存汇总", 
+            "📊 工单投入产出明细", 
+            "📈 成本明细",
+            "🕸️ 材料流向图",
+            "⛓️ 边表与路径表",
+        ]
+        if has_step_result:
+            tab_labels.append("🔄 逐步结转法")
+        if has_super_result:
+            tab_labels.append("🔬 超级成本还原")
+        if has_sales_result:
+            tab_labels.append("🚚 销售成本")
+        
+        tab_vars = st.tabs(tab_labels)
+        
+        tab_idx = 0
+        tab1 = tab_vars[tab_idx]; tab_idx += 1
+        tab2 = tab_vars[tab_idx]; tab_idx += 1
+        tab3 = tab_vars[tab_idx]; tab_idx += 1
+        tab4 = tab_vars[tab_idx]; tab_idx += 1
+        tab5 = tab_vars[tab_idx]; tab_idx += 1
+        if has_step_result:
+            step_tab = tab_vars[tab_idx]; tab_idx += 1
+        if has_super_result:
+            super_tab = tab_vars[tab_idx]; tab_idx += 1
+        if has_sales_result:
+            sales_tab = tab_vars[tab_idx]; tab_idx += 1
         
         with tab1:
             # 统计卡片
@@ -1245,9 +1260,8 @@ def render_cost_accounting():
                 else:
                     st.info("暂无路径数据")
         
-        # Tab 6/7: 逐步结转法结果（如果有）
+        # Tab: 逐步结转法结果（如果有）
         if has_step_result:
-            step_tab = tab6  # 逐步结转法固定用 tab6
             with step_tab:
                 st.markdown("##### 逐步结转法计算结果")
                 st.info("""
@@ -1277,9 +1291,8 @@ def render_cost_accounting():
                     st.dataframe(result['逐步结转_成本明细'].sort_values('总成本', ascending=False),
                                 use_container_width=True, height=500)
         
-        # Tab 6/7: 超级成本还原结果（如果有）
+        # Tab: 超级成本还原结果（如果有）
         if has_super_result:
-            super_tab = tab7 if has_step_result else tab6
             with super_tab:
                 st.markdown("##### 🔬 超级成本还原")
                 st.info("""
@@ -1294,21 +1307,36 @@ def render_cost_accounting():
                 n_dims = perf.get('超级还原维度数', 0)
                 st.caption(f"成本维度总数: **{n_dims}** 个")
                 
-                sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
-                    "📋 长格式明细", 
-                    "🏆 TopN汇总", 
-                    "📖 维度定义",
-                    "✅ 验证差异"
-                ])
+                sub_tabs = ["📋 完工成本", "🏆 TopN汇总", "📖 维度定义", "✅ 验证差异"]
+                has_sales_super = '超级还原_销售成本' in result
+                if has_sales_super:
+                    sub_tabs.append("🚚 销售成本")
+                
+                sub_tab_vars = st.tabs(sub_tabs)
+                sub_tab1 = sub_tab_vars[0]
+                sub_tab2 = sub_tab_vars[1]
+                sub_tab3 = sub_tab_vars[2]
+                sub_tab4 = sub_tab_vars[3]
+                if has_sales_super:
+                    sub_tab5 = sub_tab_vars[4]
                 
                 with sub_tab1:
-                    st.markdown("##### 超级成本还原 - 长格式明细")
+                    st.markdown("##### 超级成本还原 - 完工成本")
                     st.caption("每行一个(产品, 维度)组合，易于筛选和排序")
-                    if '超级还原_长格式明细' in result and not result['超级还原_长格式明细'].empty:
-                        st.dataframe(result['超级还原_长格式明细'],
+                    if '超级还原_完工成本' in result and not result['超级还原_完工成本'].empty:
+                        st.dataframe(result['超级还原_完工成本'],
                                     use_container_width=True, height=500)
                     else:
                         st.info("暂无超级成本还原明细数据")
+                
+                with sub_tab5:
+                    st.markdown("##### 超级成本还原 - 销售成本")
+                    st.caption("每行一个(批次, 产品, 维度)组合")
+                    if '超级还原_销售成本' in result and not result['超级还原_销售成本'].empty:
+                        st.dataframe(result['超级还原_销售成本'],
+                                    use_container_width=True, height=500)
+                    else:
+                        st.info("暂无销售成本超级还原数据（需同时上传销售数据并勾选超级成本还原）")
                 
                 with sub_tab2:
                     st.markdown("##### 超级成本还原 - TopN汇总")
@@ -1337,6 +1365,34 @@ def render_cost_accounting():
                     else:
                         st.info("暂无验证数据")
         
+        # Tab: 销售成本结果（如果有）
+        if has_sales_result:
+            with sales_tab:
+                st.markdown("##### 🚚 销售成本")
+                st.info("""
+                **销售成本计算说明**：
+                - **Sale矩阵(S)**：销售占比 = 销售数量 / 可供发出数量
+                - **Batch矩阵(B)**：批次占比 = 批次销售数量 / 物料总销售数量
+                - **公式**：C = B × S × X，其中X为成本核算结果
+                """)
+                
+                sales_df = result['销售成本明细']
+                
+                # 统计卡片
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    total_cost = sales_df['销售成本_合计'].sum()
+                    st.metric("销售总成本", f"¥{total_cost:,.2f}")
+                with c2:
+                    total_qty = sales_df['销售数量'].sum()
+                    st.metric("销售总数量", f"{total_qty:,.2f}")
+                with c3:
+                    batch_count = sales_df['销售批次号'].nunique()
+                    st.metric("批次数量", batch_count)
+                
+                # 数据表
+                st.dataframe(sales_df, use_container_width=True, height=500)
+        
         # 下载按钮
         st.divider()
         
@@ -1354,11 +1410,15 @@ def render_cost_accounting():
             export_sheets['逐步结转_投入产出明细表'] = result.get('逐步结转_工单产品材料明细', pd.DataFrame())
             export_sheets['逐步结转_成本明细'] = result['逐步结转_成本明细']
         
-        # 添加超级成本还原结果（如果有）—— 维度定义不导出，仅前端展示
+        # 添加超级成本还原结果（如果有）—— 只导出长格式明细（完工成本+销售成本）
         if has_super_result:
-            export_sheets['超级还原_长格式明细'] = result.get('超级还原_长格式明细', pd.DataFrame())
-            export_sheets['超级还原_TopN汇总'] = result.get('超级还原_TopN汇总', pd.DataFrame())
-            export_sheets['超级还原_验证差异'] = result.get('超级还原_验证差异', pd.DataFrame())
+            export_sheets['超级还原_完工成本'] = result.get('超级还原_完工成本', pd.DataFrame())
+            if '超级还原_销售成本' in result:
+                export_sheets['超级还原_销售成本'] = result['超级还原_销售成本']
+        
+        # 添加销售成本结果（如果有）
+        if has_sales_result:
+            export_sheets['销售成本明细'] = result['销售成本明细']
         
         # 添加边表和路径表
         calc = st.session_state.cost_calc
@@ -1373,6 +1433,7 @@ def render_cost_accounting():
         excel = to_excel(export_sheets)
         st.download_button("📥 下载Excel结果", excel, "成本核算结果.xlsx", 
                           use_container_width=True)
+        
 
 # ==================== 成本还原页面 ====================
 def render_cost_restoration():
