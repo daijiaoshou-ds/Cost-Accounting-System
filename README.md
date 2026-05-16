@@ -1,14 +1,27 @@
 # 🧮 矩阵成本核算引擎
 
-基于矩阵算法的企业成本核算系统，通过线性代数方法精确计算产品成本（料、工、费）。
+基于**稀疏矩阵算法**的企业成本核算系统，通过线性代数方法精确计算产品成本（料、工、费），并支持多维度的成本还原与销售成本追溯。
+
+> **核心公式**：`X = (I - WD)⁻¹ × F`
+>
+> 其中 `D` 为完工率阀门矩阵，`W` 为物料-工单流转稀疏矩阵，`F` 为期初/采购/人工/制费等外部投入。
+
+---
 
 ## ✨ 功能特性
 
-- 📊 **智能数据识别** - 自动匹配 Excel 字段，支持灵活的数据格式
-- 🧮 **矩阵成本计算** - 使用线性代数求解产品成本，准确分摊材料、人工、制造费用
-- ⚡ **高性能计算** - 基于 NumPy 的矩阵运算，处理大规模数据效率高
-- 📈 **可视化展示** - 收发存汇总 + 成本明细双视图
-- 📥 **Excel 导出** - 一键下载计算结果
+| 功能 | 说明 |
+|------|------|
+| 📊 **智能数据识别** | 自动匹配 Excel 字段，支持批量上传，灵活适配各种数据格式 |
+| 🧮 **矩阵成本计算** | 基于 SciPy 稀疏矩阵求解，轻松处理万级节点规模 |
+| 🔬 **超级成本还原** | 每个原始成本来源（期初/采购/人工/制费）独立追踪，精确到维度 |
+| 🚚 **销售成本追溯** | `C = B × S × X`，串联采购→生产→销售，还原每笔销售的成本构成 |
+| 🔄 **逐步结转法** | 平行结转法的补充，支持人工/制费按完工率逐步结转 |
+| 🕸️ **材料流向图** | 交互式桑基图，直观展示物料从投入到产出的完整流转 |
+| ⛓️ **边表与路径表** | 完整的根到叶路径分析，支持消耗关系穿透 |
+| 📥 **Excel 导出** | 一键下载全部计算结果，含收发存/明细/还原/销售等多 Sheet |
+
+---
 
 ## 🚀 快速开始
 
@@ -24,16 +37,24 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+应用默认运行在 `http://localhost:8501`
+
+---
+
 ## 📋 数据要求
 
-系统需要导入以下 4 类 Excel 数据文件：
+系统需要导入以下 Excel 数据文件：
 
-| 文件类型 | 必需字段 |
-|---------|---------|
-| **期初结存** | 物料编码、期初金额、期初数量 |
-| **采购入库** | 物料编码、采购数量、采购金额 |
-| **投入产出明细** | 工单号、产品编码、产品完工数量、材料编码、材料领用数量 |
-| **工单人工制费** | 工单号、人工、制费 |
+| 文件类型 | 必需字段 | 说明 |
+|---------|---------|------|
+| **期初结存** | 物料编码、期初金额、期初数量 | 物料期初库存 |
+| **采购入库** | 物料编码、采购数量、采购金额 | 本期采购数据 |
+| **投入产出明细** | 工单号、产品编码、产品完工数量、材料编码、材料领用数量 | 生产消耗关系 |
+| **工单人工制费** | 工单号、人工、制费 | 间接费用分摊 |
+| **销售数据** *(可选)* | 物料编码、销售数量、销售批次号 | 销售成本追溯 |
+| **产成品入库明细** *(可选)* | 产品编码、入库数量 | 收发存报表完工口径 |
+
+---
 
 ## 🏗️ 技术架构
 
@@ -44,45 +65,73 @@ streamlit run app.py
 └─────────────┘     └─────────────┘     └──────┬──────┘
                                                │
 ┌─────────────┐     ┌─────────────┐     ┌──────▼──────┐
-│  结果展示    │◀────│  矩阵求解    │◀────│  W/F 矩阵   │
-│  & Excel导出 │     │  (I-W)⁻¹F   │     │   构建      │
+│  结果展示    │◀────│  稀疏矩阵求解 │◀────│  W/F 矩阵   │
+│  & Excel导出 │     │ (I-WD)⁻¹F   │     │   构建      │
 └─────────────┘     └─────────────┘     └─────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│  超级成本还原  │  销售成本追溯  │  逐步结转法  │  流向图  │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### 核心算法
 
-系统构建转移矩阵 **W** 和外部投入矩阵 **F**，通过求解线性方程组计算各节点成本：
+1. **稀疏 W 矩阵**：工单→物料的产出比例 + 物料→工单的消耗比例，全程 CSR 格式不转稠密
+2. **阀门 D 矩阵**：完工率控制材料成本的完工/在产分配，工费全额给完工产品
+3. **双路径求解**：材料路径 `(I - W·D)⁻¹F_料` + 工费路径 `(I - W)⁻¹F_工/费`
+4. **Sale + Batch 矩阵**：销售成本 `C = B × S × X`，支持批次级成本拆分
 
-```
-X = (I - W)⁻¹ × F
-```
-
-其中：
-- **X**: 各节点的总成本（料、工、费）
-- **W**: 物料与工单之间的消耗/产出比例矩阵
-- **F**: 期初、采购、人工、制费等外部投入
+---
 
 ## 📁 项目结构
 
 ```
 .
-├── app.py           # Streamlit 主应用（交互界面）
-├── logic.py         # 核心计算逻辑（CostCalculator 类）
-├── requirements.txt # Python 依赖
-└── README.md        # 项目说明
+├── app.py              # Streamlit 主应用（交互界面）
+├── logic.py            # 核心计算逻辑（CostCalculator 类，稀疏矩阵版）
+├── requirements.txt    # Python 依赖
+├── theory.md           # 算法原理与公式推导
+├── README.md           # 项目说明
+├── .streamlit/
+│   └── config.toml     # Streamlit 配置
+└── .venv/              # 虚拟环境
 ```
+
+---
 
 ## 🛠️ 技术栈
 
 - **Python 3.11+**
 - **Streamlit** - Web 应用框架
 - **Pandas** - 数据处理
-- **NumPy** - 矩阵运算
+- **NumPy / SciPy** - 稀疏矩阵运算（`scipy.sparse`, `scipy.sparse.linalg.spsolve`）
+- **Plotly** - 交互式可视化
 - **OpenPyXL** - Excel 读写
 
-## 📄 许可协议
+---
 
-MIT License
+## 📄 许可证
+
+**GNU Affero General Public License v3.0 (AGPL-3.0)**
+
+```
+矩阵成本核算引擎
+Copyright (C) 2026
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+```
 
 ---
 
