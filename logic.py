@@ -5,6 +5,10 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
+# ========== 稀疏矩阵支持 ==========
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+
 class CostCalculator:
     def __init__(self):
         self.initial_df = None
@@ -133,8 +137,7 @@ class CostCalculator:
         calculate_super_restoration : bool, optional
             是否计算超级成本还原，默认为False
         """
-        from scipy import sparse
-        from scipy.sparse.linalg import spsolve, splu
+        # 稀疏矩阵模块已在文件顶部导入
         
         total_start = time.time()
         
@@ -286,9 +289,21 @@ class CostCalculator:
             col_indices.append(self.node_index[material])
             data.append(ratio)
         
-        W_sparse = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
-        W_dense = W_sparse.toarray()
-        self.W_matrix = W_dense
+        W = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
+        self.W_matrix = W
+        
+        # ========== 三道保险（Release必备）==========
+        # 保险1：列和校验（防超领导致成本发散）
+        col_sums = np.array(W.sum(axis=0)).flatten()
+        if np.any(col_sums > 1 + 1e-6):
+            bad_nodes = [self.all_nodes[i] for i in np.where(col_sums > 1)[0]]
+            raise ValueError(f"以下物料存在超领（领用>可供发出），成本将扭曲：{bad_nodes}")
+        
+        # 保险2：DAG无环校验（防自循环导致矩阵不可逆）
+        diag = W.diagonal()
+        if np.any(diag > 1e-6):
+            bad_nodes = [self.all_nodes[i] for i in np.where(diag > 1e-6)[0]]
+            raise ValueError(f"W矩阵存在自环（如工单领用自己产出的物料），节点：{bad_nodes}")
         
         self.performance_log['构建矩阵'] = time.time() - t0
         
@@ -328,6 +343,10 @@ class CostCalculator:
             D_mat[self.node_index[mat]] = 1.0
             D_loh[self.node_index[mat]] = 1.0
         
+        # 保险3：D矩阵范围校验
+        if np.any(D_mat < 0) or np.any(D_mat > 1):
+            raise ValueError("D矩阵（完工率/转出率）存在非法值，必须在[0,1]之间")
+        
         # 保存D矩阵供成本还原使用
         self.D_matrix = D_mat
         
@@ -356,21 +375,22 @@ class CostCalculator:
         
         # Step 6: 求解总成本 X = (I-WD)^(-1) * F
         t0 = time.time()
-        I = np.eye(n)
+        I = sparse.eye(n)
         
-        # 材料路径：I - W * D_mat
-        W_mat = W_dense * D_mat
+        # D矩阵列缩放：W_mat[:,j] = W[:,j] * D_mat[j]
+        W_mat_data = W.data.copy() * D_mat[W.indices]
+        W_mat = sparse.csr_matrix((W_mat_data, W.indices.copy(), W.indptr.copy()), shape=(n, n))
         A_mat = I - W_mat
-        
-        # 工费路径：I - W（D_loh=I）
-        A_loh = I - W_dense
+        A_loh = I - W
         
         try:
-            X_mat = np.linalg.solve(A_mat, F[:, 0:1])
-            X_loh = np.linalg.solve(A_loh, F[:, 1:3])
-        except np.linalg.LinAlgError:
-            X_mat = np.linalg.pinv(A_mat) @ F[:, 0:1]
-            X_loh = np.linalg.pinv(A_loh) @ F[:, 1:3]
+            # spsolve返回1D数组，需reshape
+            X_mat = spsolve(A_mat, F[:, 0]).reshape(-1, 1)
+            X_loh = spsolve(A_loh, F[:, 1:3])
+        except Exception:
+            # Fallback：万一稀疏求解崩了，回退到稠密
+            X_mat = np.linalg.solve(A_mat.toarray(), F[:, 0:1])
+            X_loh = np.linalg.solve(A_loh.toarray(), F[:, 1:3])
         
         X = np.hstack([X_mat, X_loh])
         X = np.round(X, 4)
@@ -540,15 +560,15 @@ class CostCalculator:
                 super_X = np.zeros((n, n_dims))
                 if len(mat_dim_indices) > 0:
                     try:
-                        super_X[:, mat_dim_indices] = np.linalg.solve(A_mat, super_F[:, mat_dim_indices])
-                    except np.linalg.LinAlgError:
-                        super_X[:, mat_dim_indices] = np.linalg.pinv(A_mat) @ super_F[:, mat_dim_indices]
+                        super_X[:, mat_dim_indices] = spsolve(A_mat, super_F[:, mat_dim_indices])
+                    except Exception:
+                        super_X[:, mat_dim_indices] = np.linalg.solve(A_mat.toarray(), super_F[:, mat_dim_indices])
                 
                 if len(loh_dim_indices) > 0:
                     try:
-                        super_X[:, loh_dim_indices] = np.linalg.solve(A_loh, super_F[:, loh_dim_indices])
-                    except np.linalg.LinAlgError:
-                        super_X[:, loh_dim_indices] = np.linalg.pinv(A_loh) @ super_F[:, loh_dim_indices]
+                        super_X[:, loh_dim_indices] = spsolve(A_loh, super_F[:, loh_dim_indices])
+                    except Exception:
+                        super_X[:, loh_dim_indices] = np.linalg.solve(A_loh.toarray(), super_F[:, loh_dim_indices])
                 
                 super_X = np.round(super_X, 4)
                 
@@ -702,7 +722,7 @@ class CostCalculator:
         wip_at_order_mat = X_mat[:, 0] * I_minus_D  # (1-D) × X_mat
         
         # WIP_full = W × wip_at_order_mat，但结果是n×1
-        WIP_mat_col = W_dense.dot(wip_at_order_mat)
+        WIP_mat_col = W.dot(wip_at_order_mat)
         
         # 构建完整的WIP矩阵（3列：料、工、费，工费为0）
         WIP_full = np.zeros((n, 3))
@@ -795,7 +815,7 @@ class CostCalculator:
             prod_idx = self.node_index[product]
             
             # 获取 W 矩阵产出比例（该工单对产品产出的贡献比例）
-            w_ratio = W_dense[prod_idx, order_idx]
+            w_ratio = W[prod_idx, order_idx]
             
             # 完工率（来自 D 矩阵，只用于成本分配！）
             finished_ratio = D_mat[order_idx]
@@ -875,7 +895,7 @@ class CostCalculator:
             
             order_idx = self.node_index[order]
             prod_idx = self.node_index[product]
-            w_ratio = W_dense[prod_idx, order_idx]
+            w_ratio = W[prod_idx, order_idx]
             finished_ratio = D_mat[order_idx]
             
             order_total_mat = X[order_idx, 0]
@@ -913,8 +933,8 @@ class CostCalculator:
             mat_idx = self.node_index[material]
             
             # W矩阵比例（用于展示）
-            w_mat_to_order = W_dense[order_idx, mat_idx]
-            w_order_to_prod = W_dense[prod_idx, order_idx]
+            w_mat_to_order = W[order_idx, mat_idx]
+            w_order_to_prod = W[prod_idx, order_idx]
             finished_ratio = D_mat[order_idx]
             
             # 获取该工单-产品的汇总数据
@@ -1074,10 +1094,11 @@ class CostCalculator:
                 f.write("\n")
                 f.write("=" * 80 + "\n")
                 f.write("【I + W×D 矩阵统计】\n")
-                f.write(f"  I_plus_WD 行和均值 = {I_plus_WD.sum(axis=1).mean():.4f}\n")
-                f.write(f"  I_plus_WD 行和最大 = {I_plus_WD.sum(axis=1).max():.4f}\n")
-                f.write(f"  I_plus_WD 行和最小 = {I_plus_WD.sum(axis=1).min():.4f}\n")
-                f.write(f"\n  对角线元素均值 (应为1.0) = {np.diag(I_plus_WD).mean():.4f}\n")
+                row_sums = np.array(I_plus_WD.sum(axis=1)).flatten()
+                f.write(f"  I_plus_WD 行和均值 = {row_sums.mean():.4f}\n")
+                f.write(f"  I_plus_WD 行和最大 = {row_sums.max():.4f}\n")
+                f.write(f"  I_plus_WD 行和最小 = {row_sums.min():.4f}\n")
+                f.write(f"\n  对角线元素均值 (应为1.0) = {I_plus_WD.diagonal().mean():.4f}\n")
                 
                 # 7. 找几个工单的上下游关系
                 f.write("\n")
@@ -1095,8 +1116,8 @@ class CostCalculator:
                     incoming_mats = []
                     for mat in self.material_nodes:
                         m_idx = self.node_index[mat]
-                        if W_dense[o_idx, m_idx] > 0.001:  # 材料→工单
-                            incoming_mats.append((mat, W_dense[o_idx, m_idx], X[m_idx, 1], X[m_idx, 2], S[m_idx, 1], S[m_idx, 2]))
+                        if W[o_idx, m_idx] > 0.001:  # 材料→工单
+                            incoming_mats.append((mat, W[o_idx, m_idx], X[m_idx, 1], X[m_idx, 2], S[m_idx, 1], S[m_idx, 2]))
                     
                     if incoming_mats:
                         f.write(f"  上游材料 ({len(incoming_mats)}个):\n")
@@ -1107,8 +1128,8 @@ class CostCalculator:
                     outgoing_prods = []
                     for prod in self.material_nodes:
                         p_idx = self.node_index[prod]
-                        if W_dense[p_idx, o_idx] > 0.001:  # 工单→产品
-                            outgoing_prods.append((prod, W_dense[p_idx, o_idx], X[p_idx, 1], X[p_idx, 2], S[p_idx, 1], S[p_idx, 2]))
+                        if W[p_idx, o_idx] > 0.001:  # 工单→产品
+                            outgoing_prods.append((prod, W[p_idx, o_idx], X[p_idx, 1], X[p_idx, 2], S[p_idx, 1], S[p_idx, 2]))
                     
                     if outgoing_prods:
                         f.write(f"  下游产品 ({len(outgoing_prods)}个):\n")
@@ -1117,7 +1138,7 @@ class CostCalculator:
             
             # 逐步结转法下的 WIP = W × (I-D) × S_材料
             wip_step_at_order = S_mat * I_minus_D  # (1-D) × S_材料
-            WIP_step_col = W_dense.dot(wip_step_at_order)
+            WIP_step_col = W.dot(wip_step_at_order)
             WIP_step = np.zeros((n, 3))
             WIP_step[:, 0] = WIP_step_col
             WIP_step = np.round(WIP_step, 4)
@@ -1134,7 +1155,7 @@ class CostCalculator:
                 order_idx = self.node_index[order]
                 prod_idx = self.node_index[product]
                 
-                w_ratio = W_dense[prod_idx, order_idx]
+                w_ratio = W[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 finished_q = row['产品完工数量']
@@ -1191,7 +1212,7 @@ class CostCalculator:
                 
                 order_idx = self.node_index[order]
                 prod_idx = self.node_index[product]
-                w_ratio = W_dense[prod_idx, order_idx]
+                w_ratio = W[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 # 逐步结转法使用S矩阵
@@ -1228,8 +1249,8 @@ class CostCalculator:
                 mat_idx = self.node_index[material]
                 
                 # W矩阵比例（用于展示）
-                w_mat_to_order = W_dense[order_idx, mat_idx]
-                w_order_to_prod = W_dense[prod_idx, order_idx]
+                w_mat_to_order = W[order_idx, mat_idx]
+                w_order_to_prod = W[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 # 获取该工单-产品的汇总数据
@@ -1339,7 +1360,7 @@ class CostCalculator:
         with open(r'D:\桌面\公众号\成本核算系统\log\debug_w_matrix.txt', 'w', encoding='utf-8') as f:
             f.write("=== W 矩阵列和检查 ===\n")
             
-            col_sums = np.sum(W_dense, axis=0)
+            col_sums = np.array(W.sum(axis=0)).flatten()
             max_col = np.max(col_sums)
             max_idx = np.argmax(col_sums)
             
@@ -1352,15 +1373,16 @@ class CostCalculator:
                 if col_sums[i] > 1.01:  # 允许1%误差
                     f.write(f"{self.all_nodes[i]}: {col_sums[i]:.4f}\n")
                     # 显示这一列的非零元素（谁领用了它）
-                    non_zero = np.where(W_dense[:, i] > 0.001)[0]
+                    col = W[:, i].toarray().flatten()
+                    non_zero = np.where(col > 0.001)[0]
                     f.write(f"  被领用情况:\n")
                     for j in non_zero:
-                        f.write(f"    {self.all_nodes[j]}: {W_dense[j, i]:.4f}\n")
+                        f.write(f"    {self.all_nodes[j]}: {col[j]:.4f}\n")
                     f.write("\n")
             
             # 检查是否有自环（对角线元素）
             f.write("\n=== 对角线检查 ===\n")
-            diag = np.diag(W_dense)
+            diag = W.diagonal()
             if np.any(diag > 0.001):
                 f.write("警告：存在自环！\n")
                 for i in range(len(self.all_nodes)):
@@ -1509,10 +1531,9 @@ class CostCalculator:
             raise ValueError("F矩阵未找到，请重新执行成本核算")
         
         n = len(self.all_nodes)
-        W_dense = self.W_matrix
+        W = self.W_matrix  # 现在是稀疏csr
         D_mat = self.D_matrix
         F_orig = self.F_matrix  # 原始F矩阵（只有工单有人工制费）
-        I = np.eye(n)
         
         # Step 1: 读取逐步结转法的 S_材料、S_人工、S_制费
         # 注意：step_map 是 {原列名: 标准名}，需要反转使用
@@ -1566,21 +1587,20 @@ class CostCalculator:
         # - 材料用 D_mat（材料按完工率分配）
         # - 工费用 D_loh = I（工费全额给完工产品，不给在产品）
         
-        # 材料路径：A_mat = I - W × D_mat
-        WD_mat = W_dense * D_mat
-        A_mat = I - WD_mat
-        
-        # 工费路径：A_loh = I - W（D_loh = I，工费不给在产品）
-        A_loh = I - W_dense
+        # 稀疏构建 A_mat 和 A_loh
+        W_mat_data = W.data.copy() * D_mat[W.indices]
+        W_mat = sparse.csr_matrix((W_mat_data, W.indices.copy(), W.indptr.copy()), shape=(n, n))
+        A_mat = sparse.eye(n) - W_mat
+        A_loh = sparse.eye(n) - W
         
         # Step 4: 求解 X_人工 和 X_制费（使用原始F矩阵的人工制费）
         # 注意：人工和制费应该用 A_loh（工费路径），不是 A_mat！
         try:
-            X_true_lab = np.linalg.solve(A_loh, F_lab)  # X_人工 = (I - W)^(-1) × F_人工
-            X_true_oh = np.linalg.solve(A_loh, F_oh)    # X_制费 = (I - W)^(-1) × F_制费
-        except np.linalg.LinAlgError:
-            X_true_lab = np.linalg.pinv(A_loh) @ F_lab
-            X_true_oh = np.linalg.pinv(A_loh) @ F_oh
+            X_true_lab = spsolve(A_loh, F_lab)
+            X_true_oh = spsolve(A_loh, F_oh)
+        except Exception:
+            X_true_lab = np.linalg.solve(A_loh.toarray(), F_lab)
+            X_true_oh = np.linalg.solve(A_loh.toarray(), F_oh)
         
         # Step 4: X_材料 = S_总 - X_人工 - X_制费
         X_true_mat = S_total - X_true_lab - X_true_oh

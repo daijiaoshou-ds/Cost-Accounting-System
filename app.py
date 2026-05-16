@@ -359,20 +359,20 @@ def create_sankey_graph(calc, result=None):
                     'qty':   float(row.get('数量', 0) or 0),
                 }
         
-        # 构建图结构
+        # 构建图结构（适配稀疏矩阵：用COO遍历非零元）
         def build_edges():
             edges = []
             out_map = defaultdict(list)
             in_map = defaultdict(list)
             edge_weight = {}
-            for i in range(n):
-                for j in range(n):
-                    if W[i, j] > 0.001:
-                        src, tgt, w = all_nodes[j], all_nodes[i], float(W[i, j])
-                        edges.append((src, tgt, w))
-                        out_map[src].append((tgt, w))
-                        in_map[tgt].append((src, w))
-                        edge_weight[(src, tgt)] = w
+            W_coo = W.tocoo()
+            for i, j, w in zip(W_coo.row, W_coo.col, W_coo.data):
+                if w > 0.001:
+                    src, tgt = all_nodes[j], all_nodes[i]
+                    edges.append((src, tgt, w))
+                    out_map[src].append((tgt, w))
+                    in_map[tgt].append((src, w))
+                    edge_weight[(src, tgt)] = w
             return edges, out_map, in_map, edge_weight
         
         edges, out_map, in_map, edge_weight = build_edges()
@@ -656,29 +656,29 @@ def create_edge_table(calc):
         rows = []
         edge_id = 0
         
-        for i in range(n):
-            for j in range(n):
-                if W[i, j] > 0.001:
-                    edge_id += 1
-                    source = all_nodes[j]
-                    target = all_nodes[i]
-                    weight = float(W[i, j])
-                    
-                    is_material_to_order = (source in material_nodes) and (target in order_nodes)
-                    is_order_to_material = (source in order_nodes) and (target in material_nodes)
-                    
-                    consume_ratio = f"{weight:.2%}" if is_material_to_order else "—"
-                    output_ratio = f"{weight:.2%}" if is_order_to_material else "—"
-                    
-                    rows.append({
-                        '边ID': f"E{edge_id:03d}",
-                        '起点': source,
-                        '起点类型': '工单' if source in order_nodes else '物料',
-                        '终点': target,
-                        '终点类型': '工单' if target in order_nodes else '物料',
-                        '消耗比例': consume_ratio,
-                        '产出比例': output_ratio,
-                    })
+        W_coo = W.tocoo()
+        for i, j, w in zip(W_coo.row, W_coo.col, W_coo.data):
+            if w > 0.001:
+                edge_id += 1
+                source = all_nodes[j]
+                target = all_nodes[i]
+                weight = float(w)
+                
+                is_material_to_order = (source in material_nodes) and (target in order_nodes)
+                is_order_to_material = (source in order_nodes) and (target in material_nodes)
+                
+                consume_ratio = f"{weight:.2%}" if is_material_to_order else "—"
+                output_ratio = f"{weight:.2%}" if is_order_to_material else "—"
+                
+                rows.append({
+                    '边ID': f"E{edge_id:03d}",
+                    '起点': source,
+                    '起点类型': '工单' if source in order_nodes else '物料',
+                    '终点': target,
+                    '终点类型': '工单' if target in order_nodes else '物料',
+                    '消耗比例': consume_ratio,
+                    '产出比例': output_ratio,
+                })
         
         return pd.DataFrame(rows) if rows else pd.DataFrame()
         
@@ -704,20 +704,20 @@ def create_path_table(calc):
         order_nodes = calc.order_nodes
         n = len(all_nodes)
         
-        # 构建图结构，带权重
+        # 构建图结构，带权重（适配稀疏矩阵：用COO遍历非零元）
         out_edges = {node: [] for node in all_nodes}
         in_edges = {node: [] for node in all_nodes}
         edge_weight = {}
         
-        for i in range(n):
-            for j in range(n):
-                if W[i, j] > 0.001:
-                    source = all_nodes[j]
-                    target = all_nodes[i]
-                    weight = float(W[i, j])
-                    out_edges[source].append(target)
-                    in_edges[target].append(source)
-                    edge_weight[(source, target)] = weight
+        W_coo = W.tocoo()
+        for i, j, w in zip(W_coo.row, W_coo.col, W_coo.data):
+            if w > 0.001:
+                source = all_nodes[j]
+                target = all_nodes[i]
+                weight = float(w)
+                out_edges[source].append(target)
+                in_edges[target].append(source)
+                edge_weight[(source, target)] = weight
         
         # 找出根节点（初始物料：没有入边）
         roots = [node for node in material_nodes if not in_edges[node]]
