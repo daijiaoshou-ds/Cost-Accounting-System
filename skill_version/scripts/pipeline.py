@@ -426,7 +426,7 @@ class CostPipeline:
             sc = sample_res.get('收发存', pd.DataFrame())
             if not sc.empty:
                 ctx.log.metric('stage5_物料数(示例)', len(sc))
-                ctx.log.metric('stage5_期末总成本(示例)', f"¥{sc['期末金额'].sum():,.2f}")
+                ctx.log.metric('stage5_期末总成本(示例)', f"Y{sc['期末金额'].sum():,.2f}")
 
         ctx.log.time_stage('S5_生成结果', time.time() - t0)
         return ctx

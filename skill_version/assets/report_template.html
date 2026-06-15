@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>成本分析报告</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', 'PingFang SC', sans-serif; background: #f0f2f5; color: #333; line-height:1.6; }
+.container { max-width: 1280px; margin:0 auto; padding: 24px; }
+.header { background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: white; padding: 36px 40px; border-radius: 16px; margin-bottom: 24px; }
+.header h1 { font-size: 2rem; font-weight: 700; }
+.header .sub { opacity: 0.8; margin-top: 6px; font-size: 0.9rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); text-align: center; }
+.card-num { font-size: 2rem; font-weight: 700; color: #1a237e; }
+.card-label { font-size: 0.85rem; color: #888; margin-top: 4px; }
+.section { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); padding: 28px; margin-bottom: 24px; }
+.section h2 { font-size: 1.2rem; color: #1a237e; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #e8eaf6; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media (max-width: 768px) { .grid2 { grid-template-columns: 1fr; } }
+.chart-wrap { position: relative; height: 300px; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+th { background: #e8eaf6; padding: 10px 12px; text-align: left; font-weight: 600; color: #1a237e; white-space: nowrap; }
+td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; }
+tr:hover td { background: #f8f9ff; }
+.up { color: #c62828; font-weight: 600; }
+.down { color: #2e7d32; font-weight: 600; }
+.flat { color: #888; }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
+.tag-up { background: #ffebee; color: #c62828; }
+.tag-down { background: #e8f5e9; color: #2e7d32; }
+.tag-warn { background: #fff3e0; color: #e65100; }
+.badge { display: inline-block; padding: 4px 12px; border-radius: 16px; font-size: 0.8rem; }
+.badge-red { background: #ffebee; color: #c62828; }
+.badge-yellow { background: #fff3e0; color: #e65100; }
+.badge-green { background: #e8f5e9; color: #2e7d32; }
+.note { background: #fff8e1; border-left: 4px solid #ff9800; padding: 12px 16px; border-radius: 4px; margin: 16px 0; font-size: 0.9rem; }
+.footer { text-align: center; color: #aaa; font-size: 0.8rem; margin-top: 32px; padding: 16px; }
+.tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 2px solid #e8eaf6; }
+.tab { padding: 10px 20px; cursor: pointer; border: none; background: none; font-size: 0.95rem; color: #888; }
+.tab.active { color: #1a237e; border-bottom: 2px solid #1a237e; margin-bottom: -2px; font-weight: 600; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>成本分析报告</h1>
+  <div class="sub">报告日期: <span id="report-date"></span> | 核算月份: <span id="report-months"></span> | 版本: <span id="report-version"></span></div>
+</div>
+
+<!-- 摘要卡片 -->
+<div class="cards" id="summary-cards"></div>
+
+<!-- 标签页 -->
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('fluctuation')">成本波动</button>
+  <button class="tab" onclick="switchTab('margin')">毛利率分析</button>
+  <button class="tab" onclick="switchTab('anomalies')">异常预警</button>
+</div>
+
+<!-- 成本波动 -->
+<div class="tab-content active" id="tab-fluctuation">
+  <div class="section">
+    <h2>月度成本波动分析</h2>
+    <div class="grid2">
+      <div>
+        <h3 style="font-size:0.95rem;margin-bottom:12px;">波动分布</h3>
+        <div id="fluctuation-dist"></div>
+      </div>
+      <div>
+        <h3 style="font-size:0.95rem;margin-bottom:12px;">月度对统计</h3>
+        <div id="month-pair-stats"></div>
+      </div>
+    </div>
+    <div style="margin-top:16px;">
+      <h3 style="font-size:0.95rem;margin:16px 0 8px 0;">Top5 波动产品</h3>
+      <table id="top5-table"></table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>波动可视化</h2>
+    <div class="chart-wrap"><canvas id="chart-fluctuation"></canvas></div>
+  </div>
+</div>
+
+<!-- 毛利率 -->
+<div class="tab-content" id="tab-margin">
+  <div class="section">
+    <h2>毛利率总览</h2>
+    <div class="cards" id="margin-cards"></div>
+    <div class="grid2">
+      <div><h3 style="font-size:0.95rem;margin-bottom:12px;">月度毛利率</h3><table id="margin-monthly"></table></div>
+      <div><h3 style="font-size:0.95rem;margin-bottom:12px;">产品线毛利率 Top10</h3><table id="margin-products"></table></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>毛利率趋势</h2>
+    <div class="chart-wrap"><canvas id="chart-margin"></canvas></div>
+  </div>
+</div>
+
+<!-- 异常预警 -->
+<div class="tab-content" id="tab-anomalies">
+  <div class="section">
+    <h2>异常预警</h2>
+    <div id="anomaly-alerts"></div>
+    <div id="anomaly-table-wrap"></div>
+  </div>
+</div>
+
+<div class="footer">矩阵成本核算引擎 v3.5 | 由 AI 自动生成</div>
+
+</div>
+
+<!-- ========== 数据嵌入 ========== -->
+<script>
+// 由 generate_report.py 填入的 JSON 数据
+window.__REPORT_DATA__ = __REPORT_DATA_PLACEHOLDER__;
+</script>
+
+<!-- ========== 渲染逻辑 ========== -->
+<script>
+const DATA = window.__REPORT_DATA__;
+const F = DATA.fluctuation?.summary || {};
+const M = DATA.margin?.summary || {};
+const IDX = DATA.index || {};
+
+// ---- 工具 ----
+function fmt(n, d) { d = d||0; return Number(n||0).toLocaleString('zh-CN', {minimumFractionDigits:d, maximumFractionDigits:d}); }
+function pct(v) { return v && v !== 'N/A' ? v : 'N/A'; }
+function cls(v) { return v > 0 ? 'up' : v < 0 ? 'down' : 'flat'; }
+
+// ---- 基础信息 ----
+document.getElementById('report-date').textContent = new Date().toLocaleDateString('zh-CN');
+document.getElementById('report-months').textContent = (IDX.months||[]).join(', ');
+document.getElementById('report-version').textContent = IDX.pipeline_version || '3.5';
+
+// ---- 摘要卡片 ----
+const m0 = IDX.month_summaries?.[IDX.months?.[0]] || {};
+let cards = [
+  ['核算月份', IDX.total_months, '个月'],
+  ['物料数量', (m0.material_count||0).toLocaleString(), '个'],
+  ['期末总成本', 'Y' + fmt(m0.ending_total_cost), ''],
+  ['计算耗时', (IDX.total_time_seconds||0).toFixed(1), '秒'],
+];
+document.getElementById('summary-cards').innerHTML = cards.map(c =>
+  `<div class="card"><div class="card-num">${c[1]}</div><div class="card-label">${c[0]} ${c[2]}</div></div>`
+).join('');
+
+// ---- 波动分布 ----
+let dist = F.fluctuation_distribution || {};
+document.getElementById('fluctuation-dist').innerHTML = Object.entries(dist).map(([k,v]) =>
+  `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0f0;">
+    <span>${k}</span><span style="font-weight:600;">${v} 个</span></div>`
+).join('');
+
+// ---- 月度对统计 ----
+let mps = F.month_pair_statistics || {};
+document.getElementById('month-pair-stats').innerHTML = Object.entries(mps).map(([k,v]) =>
+  `<div style="margin-bottom:10px;padding:10px;background:#f8f9ff;border-radius:8px;">
+    <div style="font-weight:600;margin-bottom:4px;">${k}</div>
+    <div style="font-size:0.85rem;color:#666;">
+      产品数: ${v['产品数']} | 上涨: ${v['上涨产品数']} | 下跌: ${v['下跌产品数']} | 均值: Y${fmt(v['平均变动金额'])}
+    </div></div>`
+).join('');
+
+// ---- Top5 波动表 ----
+let top5 = F.top5_fluctuations || [];
+document.getElementById('top5-table').innerHTML =
+  `<tr><th>产品编码</th><th>期间</th><th>前期成本</th><th>本期成本</th><th>变动金额</th><th>变动%</th><th>方向</th><th>归因维度</th></tr>` +
+  top5.map(t => {
+    let dir = t['变动方向'];
+    return `<tr>
+      <td>${t['产品编码']}</td><td>${t['起始月份']} → ${t['终止月份']}</td>
+      <td>Y${fmt(t['前期成本'])}</td><td>Y${fmt(t['本期成本'])}</td>
+      <td class="${cls(t['变动金额'])}">Y${fmt(t['变动金额'])}</td>
+      <td>${t['变动百分比']}</td>
+      <td><span class="tag ${dir==='上涨'?'tag-up':dir==='下跌'?'tag-down':''}">${dir}</span></td>
+      <td style="font-size:0.8rem;">${t['主要变动维度']||'--'}</td></tr>`;
+  }).join('');
+
+// ---- 波动柱状图 ----
+(function(){
+  let labels = top5.map(t => t['产品编码'].substring(0,8));
+  let values = top5.map(t => t['变动金额']);
+  let colors = values.map(v => v >= 0 ? 'rgba(198,40,40,0.7)' : 'rgba(46,125,50,0.7)');
+  new Chart(document.getElementById('chart-fluctuation'), {
+    type: 'bar',
+    data: { labels, datasets: [{ data: values, backgroundColor: colors, borderRadius: 4 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, title: { display: true, text: 'Top5 成本波动 (Y)', font: { size: 14 } } },
+      scales: { y: { ticks: { callback: v => 'Y' + v.toLocaleString() } } }
+    }
+  });
+})();
+
+// ---- 毛利率卡片 ----
+let mc = [
+  ['总销售收入', 'Y' + fmt(M.total_revenue), ''],
+  ['总销售成本', 'Y' + fmt(M.total_cost), ''],
+  ['总毛利', 'Y' + fmt(M.total_margin), ''],
+  ['整体毛利率', M.overall_margin_rate, ''],
+];
+document.getElementById('margin-cards').innerHTML = mc.map(c =>
+  `<div class="card"><div class="card-num">${c[1]}</div><div class="card-label">${c[0]}</div></div>`
+).join('');
+
+// ---- 月度毛利率表 ----
+let mm = M.monthly_statistics || {};
+document.getElementById('margin-monthly').innerHTML =
+  `<tr><th>月份</th><th>批次</th><th>收入</th><th>成本</th><th>毛利</th><th>毛利率</th></tr>` +
+  Object.entries(mm).sort().map(([k,v]) =>
+    `<tr><td>${k}</td><td>${v['批次数量']}</td><td>Y${fmt(v['销售金额'])}</td><td>Y${fmt(v['销售成本'])}</td><td class="${cls(v['毛利'])}">Y${fmt(v['毛利'])}</td><td>${pct(v['毛利率'])}</td></tr>`
+  ).join('');
+
+// ---- 产品线表 ----
+let pm = M.product_line_summary || [];
+document.getElementById('margin-products').innerHTML =
+  `<tr><th>产品</th><th>批次</th><th>收入</th><th>成本</th><th>毛利</th><th>毛利率</th></tr>` +
+  pm.slice(0,10).map(p =>
+    `<tr><td>${p['产品编码']}</td><td>${p['批次数量']}</td><td>Y${fmt(p['销售金额合计'])}</td><td>Y${fmt(p['销售成本合计'])}</td><td class="${cls(p['毛利合计'])}">Y${fmt(p['毛利合计'])}</td><td>${pct(p['毛利率'])}</td></tr>`
+  ).join('');
+
+// ---- 毛利率趋势图 ----
+(function(){
+  let months = Object.keys(mm).sort();
+  let rates = months.map(m => {
+    let r = mm[m]['毛利率'];
+    if (r === 'N/A') return null;
+    return parseFloat(r.replace('%',''));
+  });
+  new Chart(document.getElementById('chart-margin'), {
+    type: 'line',
+    data: {
+      labels: months,
+      datasets: [{
+        label: '毛利率', data: rates, borderColor: '#1a237e', backgroundColor: 'rgba(26,35,126,0.1)',
+        fill: true, tension: 0.3, pointRadius: 5
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { title: { display: true, text: '月度毛利率趋势 (%)', font: { size: 14 } } },
+      scales: { y: { ticks: { callback: v => v + '%' } } }
+    }
+  });
+})();
+
+// ---- 异常预警 ----
+let ano = M.anomalies || {};
+let negCount = ano.negative_margin_batches || 0;
+let lowCount = ano.low_margin_batches || 0;
+let alerts = [];
+if (negCount > 0) alerts.push(`<span class="badge badge-red">负毛利: ${negCount} 批次</span>`);
+if (lowCount > 0) alerts.push(`<span class="badge badge-yellow">低毛利<5%: ${lowCount} 批次</span>`);
+if (alerts.length === 0) alerts.push('<span class="badge badge-green">未发现异常批次</span>');
+document.getElementById('anomaly-alerts').innerHTML = alerts.join(' &nbsp; ');
+
+let negDetail = ano.negative_margin_details || [];
+if (negDetail.length > 0) {
+  document.getElementById('anomaly-table-wrap').innerHTML =
+    `<h3 style="font-size:0.95rem;margin:16px 0 8px 0;">负毛利批次明细</h3>
+    <table><tr><th>月份</th><th>产品编码</th><th>批次号</th><th>收入</th><th>成本</th><th>毛利</th><th>毛利率</th></tr>` +
+    negDetail.slice(0,30).map(a =>
+      `<tr><td>${a['月份']}</td><td>${a['产品编码']}</td><td>${a['销售批次号']}</td><td>Y${fmt(a['销售金额'])}</td><td>Y${fmt(a['销售成本'])}</td><td class="${cls(a['毛利'])}">Y${fmt(a['毛利'])}</td><td>${a['毛利率']}</td></tr>`
+    ).join('') + '</table>';
+}
+
+// ---- 标签页切换 ----
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    t.classList.toggle('active', t.textContent.includes(name === 'fluctuation' ? '成本波动' : name === 'margin' ? '毛利率' : '异常'));
+  });
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+}
+</script>
+</body>
+</html>

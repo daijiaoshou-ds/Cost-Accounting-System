@@ -62,6 +62,7 @@ TABLE_SCHEMA = {
         'rename': {'存货编码': '物料编码', '出库单号': '销售批次号'},
         'groupby': ['年度', '月份', '物料编码', '销售批次号'],
         'agg': {'销售数量': 'sum'},
+        'optional': {'销售金额': 0},  # 可选，用于毛利率分析
     },
 }
 
@@ -102,9 +103,16 @@ def load_and_aggregate(file_dict, mapping_dict):
             missing = [c for c in required if c not in df.columns]
             if missing:
                 raise ValueError(f"表 {table} 缺少必要字段: {missing}")
-            
+
+            # 可选字段：不存在时用默认值填充
+            optional = schema.get('optional', {})
+            for opt_col, default_val in optional.items():
+                if opt_col not in df.columns:
+                    df[opt_col] = default_val
+
             df = df.rename(columns=rename)
             internal_cols = [rename.get(c, c) for c in required]
+            internal_cols += [rename.get(c, c) for c in optional.keys()]
             internal_cols = list(dict.fromkeys(internal_cols))
             df = df[internal_cols].copy()
         
@@ -271,8 +279,15 @@ class CostCalculator:
             df_sales = df_sales.copy()
             df_sales['物料编码'] = df_sales['物料编码'].astype(str).str.strip()
             df_sales['销售数量'] = pd.to_numeric(df_sales['销售数量'], errors='coerce').fillna(0)
+            if '销售金额' in df_sales.columns:
+                df_sales['销售金额'] = pd.to_numeric(df_sales['销售金额'], errors='coerce').fillna(0)
+            else:
+                df_sales['销售金额'] = 0
             df_sales['销售批次号'] = df_sales['销售批次号'].astype(str).str.strip()
-            self.sales_df = df_sales.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+            sales_agg = {'销售数量': 'sum'}
+            if '销售金额' in df_sales.columns:
+                sales_agg['销售金额'] = 'sum'
+            self.sales_df = df_sales.groupby(['物料编码', '销售批次号']).agg(sales_agg).reset_index()
         
         # 完工入库（可选）
         df_fin = data_dict.get('finished', pd.DataFrame())
@@ -638,10 +653,14 @@ class CostCalculator:
                 cost_oh = batch_ratio * SX[mat_idx, 2]
                 cost_total = cost_mat + cost_lab + cost_oh
                 
+                # 获取该批次的销售金额
+                sales_amount = float(row.get('销售金额', 0) or 0)
+
                 sales_rows.append({
                     '销售批次号': batch,
                     '物料编码': mat,
                     '销售数量': round(qty, 2),
+                    '销售金额': round(sales_amount, 2),
                     '可供发出数量': round(avail, 2),
                     '销售占比': f"{sales_ratio:.2%}",
                     '批次占物料销售比': f"{batch_ratio:.2%}",
@@ -649,6 +668,8 @@ class CostCalculator:
                     '销售成本_工': round(cost_lab, 2),
                     '销售成本_费': round(cost_oh, 2),
                     '销售成本_合计': round(cost_total, 2),
+                    '毛利': round(sales_amount - cost_total, 2),
+                    '毛利率': f"{(sales_amount - cost_total) / sales_amount:.2%}" if sales_amount > 0 else "N/A",
                 })
             
             sales_cost_df = pd.DataFrame(sales_rows)
@@ -669,20 +690,30 @@ class CostCalculator:
             dim_info = []
             dim_entries = []  # (dim_idx, node_idx, value)
             
-            # 材料维度（期初）
+            # 期初维度（拆为期初材料/期初人工/期初制费三个独立维度）
             for _, row in self.initial_df.iterrows():
                 mat = str(row['物料编码']).strip()
-                amt = row['期初金额']
-                if mat in self.node_index and amt > 0:
-                    idx = len(super_dims)
-                    super_dims.append(f"{mat}_期初")
-                    mat_dim_indices.append(idx)
-                    dim_entries.append((idx, self.node_index[mat], amt))
-                    dim_info.append({
-                        '维度名称': f"{mat}_期初", '维度类型': '期初',
-                        '来源节点': mat, '原始金额': amt,
-                        '说明': f'物料{mat}的期初金额'
-                    })
+                if mat not in self.node_index:
+                    continue
+                amt_mat = float(row.get('期初材料', 0) or 0)
+                amt_lab = float(row.get('期初人工', 0) or 0)
+                amt_oh = float(row.get('期初制费', 0) or 0)
+
+                for dim_key, amt, dim_type in [
+                    (f"{mat}_期初材料", amt_mat, '期初'),
+                    (f"{mat}_期初人工", amt_lab, '期初'),
+                    (f"{mat}_期初制费", amt_oh, '期初'),
+                ]:
+                    if amt > 0:
+                        idx = len(super_dims)
+                        super_dims.append(dim_key)
+                        mat_dim_indices.append(idx)
+                        dim_entries.append((idx, self.node_index[mat], amt))
+                        dim_info.append({
+                            '维度名称': dim_key, '维度类型': dim_type,
+                            '来源节点': mat, '原始金额': amt,
+                            '说明': f'物料{mat}的{dim_key}'
+                        })
             
             # 材料维度（采购）
             for _, row in self.purchase_df.iterrows():
@@ -1517,10 +1548,13 @@ class CostCalculator:
             cost_oh = batch_ratio * SX[mat_idx, 2]
             cost_total = cost_mat + cost_lab + cost_oh
             
+            sales_amount = float(row.get('销售金额', 0) or 0)
+
             result_list.append({
                 '销售批次号': batch,
                 '物料编码': mat,
                 '销售数量': round(qty, 2),
+                '销售金额': round(sales_amount, 2),
                 '可供发出数量': round(avail, 2),
                 '销售占比': f"{sales_ratio:.2%}",
                 '批次占物料销售比': f"{batch_ratio:.2%}",
@@ -1528,6 +1562,8 @@ class CostCalculator:
                 '销售成本_工': round(cost_lab, 2),
                 '销售成本_费': round(cost_oh, 2),
                 '销售成本_合计': round(cost_total, 2),
+                '毛利': round(sales_amount - cost_total, 2),
+                '毛利率': f"{(sales_amount - cost_total) / sales_amount:.2%}" if sales_amount > 0 else "N/A",
             })
         
         # 按批次号排序
