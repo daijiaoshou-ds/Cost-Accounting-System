@@ -4,10 +4,161 @@ from io import BytesIO
 import time
 import warnings
 warnings.filterwarnings('ignore')
+import polars as pl
 
 # ========== 稀疏矩阵支持 ==========
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
+
+
+def _read_excel(file):
+    """统一 Excel 读取入口，优先 Polars+fastexcel，失败回退 pandas"""
+    try:
+        # 先用 polars 读
+        df_pl = pl.read_excel(file)
+        return df_pl.to_pandas()
+    except Exception:
+        try:
+            file.seek(0)
+            return pd.read_excel(file)
+        except Exception:
+            file.seek(0)
+            return pd.read_excel(file, engine='openpyxl')
+
+
+TABLE_SCHEMA = {
+    'initial': {
+        'required': ['年度', '月份', '存货编码', '数量', '直接材料', '直接人工', '制造费用'],
+        'rename': {'存货编码': '物料编码', '数量': '期初数量', '直接材料': '期初材料', '直接人工': '期初人工', '制造费用': '期初制费'},
+        'groupby': ['年度', '月份', '物料编码'],
+        'agg': {'期初数量': 'sum', '期初材料': 'sum', '期初人工': 'sum', '期初制费': 'sum'},
+    },
+    'purchase': {
+        'required': ['年度', '月份', '存货编码', '采购数量', '采购金额'],
+        'rename': {'存货编码': '物料编码'},
+        'groupby': ['年度', '月份', '物料编码'],
+        'agg': {'采购数量': 'sum', '采购金额': 'sum'},
+    },
+    'labor': {
+        'required': ['年度', '月份', '工单号', '直接人工', '制造费用'],
+        'rename': {'直接人工': '人工', '制造费用': '制费'},
+        'groupby': ['年度', '月份', '工单号'],
+        'agg': {'人工': 'sum', '制费': 'sum'},
+    },
+    'io': {
+        'required': ['年度', '月份', '工单号', '产品编码', '材料编码', '领用数量', '完工数量', '在产数量'],
+        'rename': {'领用数量': '材料领用数量', '完工数量': '产品完工数量', '在产数量': '在产品数量'},
+        'groupby': ['年度', '月份', '工单号', '产品编码', '材料编码'],
+        'agg': {'材料领用数量': 'sum', '产品完工数量': 'sum', '在产品数量': 'sum'},
+    },
+    'finished': {
+        'required': ['年度', '月份', '存货编码', '入库数量'],
+        'rename': {'存货编码': '产品编码'},
+        'groupby': ['年度', '月份', '产品编码'],
+        'agg': {'入库数量': 'sum'},
+    },
+    'sales': {
+        'required': ['年度', '月份', '存货编码', '出库单号', '销售数量'],
+        'rename': {'存货编码': '物料编码', '出库单号': '销售批次号'},
+        'groupby': ['年度', '月份', '物料编码', '销售批次号'],
+        'agg': {'销售数量': 'sum'},
+    },
+}
+
+
+def load_and_aggregate(file_dict, mapping_dict):
+    """
+    读取全部上传文件，按必要字段聚合后按月份分组。
+    
+    Parameters:
+    -----------
+    file_dict : dict
+        {表名: file_like_object}，表名包括 'initial', 'purchase', 'labor', 'io', 'finished', 'sales'
+    mapping_dict : dict
+        {表名: {原始列名: 标准名}}
+    
+    Returns:
+    --------
+    dict
+        {(year, month): {'initial': df, 'purchase': df, 'labor': df, 'io': df, 'finished': df, 'sales': df}}
+    """
+    result = {}
+    for table, schema in TABLE_SCHEMA.items():
+        required = schema['required']
+        rename = schema['rename']
+        groupby = schema['groupby']
+        agg = schema['agg']
+        
+        file = file_dict.get(table)
+        if file is None:
+            internal_cols = [rename.get(c, c) for c in required if c not in ('年度', '月份')]
+            internal_cols = list(dict.fromkeys(internal_cols))
+            df = pd.DataFrame(columns=internal_cols)
+        else:
+            df = _read_excel(file)
+            col_map = mapping_dict.get(table, {})
+            df = df.rename(columns=col_map)
+            
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                raise ValueError(f"表 {table} 缺少必要字段: {missing}")
+            
+            df = df.rename(columns=rename)
+            internal_cols = [rename.get(c, c) for c in required]
+            internal_cols = list(dict.fromkeys(internal_cols))
+            df = df[internal_cols].copy()
+        
+        # 字符串字段去空格
+        str_cols = [c for c in df.columns if '编码' in c or c in ('工单号', '销售批次号')]
+        for c in str_cols:
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.strip()
+        
+        # 年度、月份转整数
+        for c in ('年度', '月份'):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
+        
+        # 数值字段清洗
+        numeric_cols = [c for c in df.columns if c not in str_cols and c not in ('年度', '月份')]
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        
+        if not df.empty:
+            df = df.groupby(groupby, as_index=False).agg(agg)
+        
+        if '年度' in df.columns and '月份' in df.columns:
+            for (year, month), g in df.groupby(['年度', '月份']):
+                key = (int(year), int(month))
+                result.setdefault(key, {})[table] = (
+                    g.drop(columns=['年度', '月份']).reset_index(drop=True)
+                )
+        else:
+            result.setdefault((0, 0), {})[table] = df.reset_index(drop=True)
+    
+    # 确保每个月份都包含所有表
+    all_tables = list(TABLE_SCHEMA.keys())
+    all_keys = list(result.keys())
+    for key in all_keys:
+        for table in all_tables:
+            if table not in result[key]:
+                schema = TABLE_SCHEMA[table]
+                internal_cols = [schema['rename'].get(c, c) for c in schema['required'] if c not in ('年度', '月份')]
+                internal_cols = list(dict.fromkeys(internal_cols))
+                result[key][table] = pd.DataFrame(columns=internal_cols)
+
+    # 如果没有找到任何月份数据（所有表都无年度/月份字段），返回默认键
+    if not result:
+        result[(0, 0)] = {}
+        for table in all_tables:
+            schema = TABLE_SCHEMA[table]
+            internal_cols = [schema['rename'].get(c, c) for c in schema['required'] if c not in ('年度', '月份')]
+            internal_cols = list(dict.fromkeys(internal_cols))
+            result[(0, 0)][table] = pd.DataFrame(columns=internal_cols)
+
+    return result
+
 
 class CostCalculator:
     def __init__(self):
@@ -16,6 +167,7 @@ class CostCalculator:
         self.io_df = None
         self.labor_df = None
         self.sales_df = None  # 销售数据
+        self.finished_df = None  # 完工入库数据
         self.result = None
         self.performance_log = {}
         
@@ -31,94 +183,106 @@ class CostCalculator:
         self.available_qty = None  # 可供发出数量（W矩阵用，材料完工口径）
         self.sales_available_qty = None  # 可供发出数量（销售用，产品完工口径）
         
-    def load_data(self, initial_file, purchase_file, io_file, labor_file, sales_file=None,
-                  initial_map=None, purchase_map=None, io_map=None, labor_map=None, sales_map=None):
-        """加载并清洗数据"""
+    def load_data(self, data_dict):
+        """
+        加载单月份已聚合的数据。
+        
+        data_dict: {
+            'initial': df,
+            'purchase': df,
+            'io': df,
+            'labor': df,
+            'finished': df,
+            'sales': df
+        }
+        """
         start_time = time.time()
         
         # 期初（可选）
-        has_initial = (initial_file is not None and 
-                      hasattr(initial_file, 'read') and 
-                      initial_map and 
-                      len(initial_map) > 0)
-        if has_initial:
-            df_init = pd.read_excel(initial_file)
-            df_init = df_init.rename(columns=initial_map)
-            df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
-            df_init['期初金额'] = pd.to_numeric(df_init['期初金额'], errors='coerce').fillna(0)
-            if '期初数量' in df_init.columns:
-                df_init['期初数量'] = pd.to_numeric(df_init['期初数量'], errors='coerce').fillna(0)
-            else:
-                df_init['期初数量'] = 0
-            self.initial_df = df_init.groupby('物料编码').agg({
-                '期初金额': 'sum',
-                '期初数量': 'sum'
-            }).reset_index()
+        df_init = data_dict.get('initial', pd.DataFrame())
+        if df_init.empty:
+            self.initial_df = pd.DataFrame(columns=['物料编码', '期初数量', '期初材料', '期初人工', '期初制费'])
         else:
-            self.initial_df = pd.DataFrame(columns=['物料编码', '期初金额', '期初数量'])
+            df_init = df_init.copy()
+            df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
+            for col in ['期初数量', '期初材料', '期初人工', '期初制费']:
+                if col in df_init.columns:
+                    df_init[col] = pd.to_numeric(df_init[col], errors='coerce').fillna(0)
+                else:
+                    df_init[col] = 0
+            self.initial_df = df_init.groupby('物料编码').agg({
+                '期初数量': 'sum',
+                '期初材料': 'sum',
+                '期初人工': 'sum',
+                '期初制费': 'sum'
+            }).reset_index()
         
         # 采购（必须）
-        df_pur = pd.read_excel(purchase_file)
-        df_pur = df_pur.rename(columns=purchase_map)
-        df_pur['物料编码'] = df_pur['物料编码'].astype(str).str.strip()
-        df_pur['采购数量'] = pd.to_numeric(df_pur['采购数量'], errors='coerce').fillna(0)
-        df_pur['采购金额'] = pd.to_numeric(df_pur['采购金额'], errors='coerce').fillna(0)
-        self.purchase_df = df_pur.groupby('物料编码').agg({
-            '采购数量': 'sum',
-            '采购金额': 'sum'
-        }).reset_index()
+        df_pur = data_dict.get('purchase', pd.DataFrame())
+        if df_pur.empty:
+            self.purchase_df = pd.DataFrame(columns=['物料编码', '采购数量', '采购金额'])
+        else:
+            df_pur = df_pur.copy()
+            df_pur['物料编码'] = df_pur['物料编码'].astype(str).str.strip()
+            df_pur['采购数量'] = pd.to_numeric(df_pur['采购数量'], errors='coerce').fillna(0)
+            df_pur['采购金额'] = pd.to_numeric(df_pur['采购金额'], errors='coerce').fillna(0)
+            self.purchase_df = df_pur.groupby('物料编码').agg({
+                '采购数量': 'sum',
+                '采购金额': 'sum'
+            }).reset_index()
         
         # 投入产出（必须）
-        df_io = pd.read_excel(io_file)
-        df_io = df_io.rename(columns=io_map)
-        df_io['工单号'] = df_io['工单号'].astype(str).str.strip()
-        df_io['产品编码'] = df_io['产品编码'].astype(str).str.strip()
-        df_io['材料编码'] = df_io['材料编码'].astype(str).str.strip()
-        df_io['产品完工数量'] = pd.to_numeric(df_io['产品完工数量'], errors='coerce').fillna(0)
-        df_io['材料领用数量'] = pd.to_numeric(df_io['材料领用数量'], errors='coerce').fillna(0)
-        
-        if '在产品数量' in df_io.columns:
-            df_io['在产品数量'] = pd.to_numeric(df_io['在产品数量'], errors='coerce').fillna(0)
+        df_io = data_dict.get('io', pd.DataFrame())
+        if df_io.empty:
+            self.io_df = pd.DataFrame(columns=['工单号', '产品编码', '材料编码', '材料领用数量', '产品完工数量', '在产品数量'])
         else:
-            df_io['在产品数量'] = 0
-        
-        df_io_clean = df_io.groupby(['工单号', '产品编码', '材料编码']).agg({
-            '材料领用数量': 'sum',
-            '产品完工数量': 'sum',
-            '在产品数量': 'sum'
-        }).reset_index()
-        
-        self.io_df = df_io_clean
+            df_io = df_io.copy()
+            df_io['工单号'] = df_io['工单号'].astype(str).str.strip()
+            df_io['产品编码'] = df_io['产品编码'].astype(str).str.strip()
+            df_io['材料编码'] = df_io['材料编码'].astype(str).str.strip()
+            df_io['产品完工数量'] = pd.to_numeric(df_io['产品完工数量'], errors='coerce').fillna(0)
+            df_io['材料领用数量'] = pd.to_numeric(df_io['材料领用数量'], errors='coerce').fillna(0)
+            if '在产品数量' in df_io.columns:
+                df_io['在产品数量'] = pd.to_numeric(df_io['在产品数量'], errors='coerce').fillna(0)
+            else:
+                df_io['在产品数量'] = 0
+            self.io_df = df_io.groupby(['工单号', '产品编码', '材料编码']).agg({
+                '材料领用数量': 'sum',
+                '产品完工数量': 'sum',
+                '在产品数量': 'sum'
+            }).reset_index()
         
         # 工单费用（可选）
-        has_labor = (labor_file is not None and 
-                    hasattr(labor_file, 'read') and 
-                    labor_map and 
-                    len(labor_map) > 0)
-        if has_labor:
-            df_lab = pd.read_excel(labor_file)
-            df_lab = df_lab.rename(columns=labor_map)
+        df_lab = data_dict.get('labor', pd.DataFrame())
+        if df_lab.empty:
+            self.labor_df = pd.DataFrame(columns=['工单号', '人工', '制费'])
+        else:
+            df_lab = df_lab.copy()
             df_lab['工单号'] = df_lab['工单号'].astype(str).str.strip()
             df_lab['人工'] = pd.to_numeric(df_lab['人工'], errors='coerce').fillna(0)
             df_lab['制费'] = pd.to_numeric(df_lab['制费'], errors='coerce').fillna(0)
             self.labor_df = df_lab.groupby('工单号')[['人工', '制费']].sum().reset_index()
-        else:
-            self.labor_df = pd.DataFrame(columns=['工单号', '人工', '制费'])
         
         # 销售数据（可选）
-        has_sales = (sales_file is not None and 
-                    hasattr(sales_file, 'read') and 
-                    sales_map and 
-                    len(sales_map) > 0)
-        if has_sales:
-            df_sales = pd.read_excel(sales_file)
-            df_sales = df_sales.rename(columns=sales_map)
+        df_sales = data_dict.get('sales', pd.DataFrame())
+        if df_sales.empty:
+            self.sales_df = pd.DataFrame(columns=['物料编码', '销售批次号', '销售数量'])
+        else:
+            df_sales = df_sales.copy()
             df_sales['物料编码'] = df_sales['物料编码'].astype(str).str.strip()
             df_sales['销售数量'] = pd.to_numeric(df_sales['销售数量'], errors='coerce').fillna(0)
             df_sales['销售批次号'] = df_sales['销售批次号'].astype(str).str.strip()
             self.sales_df = df_sales.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+        
+        # 完工入库（可选）
+        df_fin = data_dict.get('finished', pd.DataFrame())
+        if df_fin.empty:
+            self.finished_df = pd.DataFrame(columns=['产品编码', '入库数量'])
         else:
-            self.sales_df = pd.DataFrame(columns=['物料编码', '销售批次号', '销售数量'])
+            df_fin = df_fin.copy()
+            df_fin['产品编码'] = df_fin['产品编码'].astype(str).str.strip()
+            df_fin['入库数量'] = pd.to_numeric(df_fin['入库数量'], errors='coerce').fillna(0)
+            self.finished_df = df_fin.groupby('产品编码')['入库数量'].sum().reset_index()
         
         self.performance_log['数据清洗'] = time.time() - start_time
         return True
@@ -131,13 +295,17 @@ class CostCalculator:
         finished_df : DataFrame, optional
             产成品入库明细表，包含产品编码和入库数量
         finished_map : dict, optional
-            字段映射 {原列名: 标准名}
+            字段映射 {原列名: 标准名}。若已聚合为内部字段，可传 None。
         calculate_step_method : bool, optional
             是否计算逐步结转法（平行结转法的补充），默认为False
         calculate_super_restoration : bool, optional
             是否计算超级成本还原，默认为False
         """
         # 稀疏矩阵模块已在文件顶部导入
+        
+        # 若未传入 finished_df，优先使用 load_data 中保存的 finished 数据
+        if finished_df is None and self.finished_df is not None:
+            finished_df = self.finished_df
         
         total_start = time.time()
         
@@ -164,16 +332,22 @@ class CostCalculator:
         
         # 期初数据
         init_qty = {}
-        init_amt = {}
+        init_amt_mat = {}
+        init_amt_lab = {}
+        init_amt_oh = {}
         for mat in self.material_nodes:
             init_qty[mat] = 0
-            init_amt[mat] = 0
-        
+            init_amt_mat[mat] = 0
+            init_amt_lab[mat] = 0
+            init_amt_oh[mat] = 0
+
         for _, row in self.initial_df.iterrows():
             mat = str(row['物料编码'])
             if mat in init_qty:
                 init_qty[mat] = row['期初数量']
-                init_amt[mat] = row['期初金额']
+                init_amt_mat[mat] = row.get('期初材料', 0)
+                init_amt_lab[mat] = row.get('期初人工', 0)
+                init_amt_oh[mat] = row.get('期初制费', 0)
         
         # 采购数据
         pur_qty = {}
@@ -208,8 +382,10 @@ class CostCalculator:
                 finished_qty_for_w[mat] = row['产品完工数量']
         
         # 2. 报表的完工数量：优先从入库明细获取，否则用投入产出
-        if finished_df is not None and finished_map:
-            df_fin = finished_df.rename(columns=finished_map)
+        if finished_df is not None and not finished_df.empty:
+            df_fin = finished_df.copy()
+            if finished_map:
+                df_fin = df_fin.rename(columns=finished_map)
             df_fin['产品编码'] = df_fin['产品编码'].astype(str).str.strip()
             df_fin['入库数量'] = pd.to_numeric(df_fin['入库数量'], errors='coerce').fillna(0)
             fin_summary = df_fin.groupby('产品编码')['入库数量'].sum().to_dict()
@@ -357,7 +533,9 @@ class CostCalculator:
         for _, row in self.initial_df.iterrows():
             mat = str(row['物料编码'])
             if mat in self.node_index:
-                F[self.node_index[mat], 0] += row['期初金额']
+                F[self.node_index[mat], 0] += row.get('期初材料', 0)
+                F[self.node_index[mat], 1] += row.get('期初人工', 0)
+                F[self.node_index[mat], 2] += row.get('期初制费', 0)
         
         for _, row in self.purchase_df.iterrows():
             mat = str(row['物料编码'])
@@ -758,7 +936,7 @@ class CostCalculator:
             
             # 基础数量
             init_q = init_qty[mat]
-            init_a = init_amt[mat]
+            init_a = init_amt_mat[mat] + init_amt_lab[mat] + init_amt_oh[mat]
             pur_q = pur_qty[mat]
             fin_q = finished_qty_for_report[mat]  # 报表用入库明细的完工数量
             
@@ -1023,119 +1201,6 @@ class CostCalculator:
             S = np.column_stack([S_mat, S_lab, S_oh])
             S = np.round(S, 4)
             
-            # ==================== DEBUG: 打印矩阵数据 ====================
-            debug_log_path = r'D:\桌面\公众号\成本核算系统\log\debug_step_method.txt'
-            with open(debug_log_path, 'w', encoding='utf-8') as f:
-                f.write("=" * 80 + "\n")
-                f.write("逐步结转法调试报告\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # 1. 矩阵维度信息
-                f.write(f"【矩阵维度】\n")
-                f.write(f"  n (节点总数) = {n}\n")
-                f.write(f"  物料节点数 = {len(self.material_nodes)}\n")
-                f.write(f"  工单节点数 = {len(self.order_nodes)}\n\n")
-                
-                # 2. F 矩阵汇总
-                f.write(f"【F矩阵 - 外部投入】\n")
-                f.write(f"  F_材料总和 = {F[:, 0].sum():.4f}\n")
-                f.write(f"  F_人工总和 = {F[:, 1].sum():.4f}\n")
-                f.write(f"  F_制费总和 = {F[:, 2].sum():.4f}\n")
-                f.write(f"  F_总计 = {F.sum():.4f}\n\n")
-                
-                # 3. X 矩阵汇总 (平行结转法结果)
-                f.write(f"【X矩阵 - 平行结转法结果】\n")
-                f.write(f"  X_材料总和 = {X[:, 0].sum():.4f}\n")
-                f.write(f"  X_人工总和 = {X[:, 1].sum():.4f}\n")
-                f.write(f"  X_制费总和 = {X[:, 2].sum():.4f}\n")
-                f.write(f"  X_总计 = {X.sum():.4f}\n\n")
-                
-                # 4. S 矩阵汇总 (逐步结转法结果)
-                f.write(f"【S矩阵 - 逐步结转法结果】\n")
-                f.write(f"  S_材料总和 = {S[:, 0].sum():.4f}\n")
-                f.write(f"  S_人工总和 = {S[:, 1].sum():.4f}\n")
-                f.write(f"  S_制费总和 = {S[:, 2].sum():.4f}\n")
-                f.write(f"  S_总计 = {S.sum():.4f}\n\n")
-                
-                # 5. 关键节点对比 (前10个工单和前10个物料)
-                f.write("=" * 80 + "\n")
-                f.write("【关键节点对比 - 前10个工单】\n")
-                f.write("-" * 80 + "\n")
-                f.write(f"{'节点':<15} {'类型':<8} {'F_工':<12} {'F_费':<12} {'X_工':<12} {'X_费':<12} {'S_工':<12} {'S_费':<12}\n")
-                f.write("-" * 80 + "\n")
-                
-                order_count = 0
-                for node in self.all_nodes:
-                    if node in self.order_nodes:
-                        idx = self.node_index[node]
-                        f.write(f"{node:<15} {'工单':<8} {F[idx, 1]:<12.4f} {F[idx, 2]:<12.4f} {X[idx, 1]:<12.4f} {X[idx, 2]:<12.4f} {S[idx, 1]:<12.4f} {S[idx, 2]:<12.4f}\n")
-                        order_count += 1
-                        if order_count >= 10:
-                            break
-                
-                f.write("\n")
-                f.write("【关键节点对比 - 前10个物料】\n")
-                f.write("-" * 80 + "\n")
-                f.write(f"{'节点':<15} {'类型':<8} {'X_总':<12} {'X_料':<12} {'X_工':<12} {'X_费':<12} {'S_料':<12} {'S_工':<12} {'S_费':<12}\n")
-                f.write("-" * 80 + "\n")
-                
-                mat_count = 0
-                for node in self.all_nodes:
-                    if node in self.material_nodes:
-                        idx = self.node_index[node]
-                        x_total = X[idx].sum()
-                        s_total = S[idx].sum()
-                        f.write(f"{node:<15} {'物料':<8} {x_total:<12.4f} {X[idx, 0]:<12.4f} {X[idx, 1]:<12.4f} {X[idx, 2]:<12.4f} {S[idx, 0]:<12.4f} {S[idx, 1]:<12.4f} {S[idx, 2]:<12.4f}\n")
-                        mat_count += 1
-                        if mat_count >= 10:
-                            break
-                
-                # 6. I + W×D 矩阵的统计
-                f.write("\n")
-                f.write("=" * 80 + "\n")
-                f.write("【I + W×D 矩阵统计】\n")
-                row_sums = np.array(I_plus_WD.sum(axis=1)).flatten()
-                f.write(f"  I_plus_WD 行和均值 = {row_sums.mean():.4f}\n")
-                f.write(f"  I_plus_WD 行和最大 = {row_sums.max():.4f}\n")
-                f.write(f"  I_plus_WD 行和最小 = {row_sums.min():.4f}\n")
-                f.write(f"\n  对角线元素均值 (应为1.0) = {I_plus_WD.diagonal().mean():.4f}\n")
-                
-                # 7. 找几个工单的上下游关系
-                f.write("\n")
-                f.write("=" * 80 + "\n")
-                f.write("【典型工单上下游关系】\n")
-                sample_orders = self.order_nodes[:5] if len(self.order_nodes) >= 5 else self.order_nodes
-                for order in sample_orders:
-                    o_idx = self.node_index[order]
-                    f.write(f"\n工单: {order}\n")
-                    f.write(f"  本节点: F_工={F[o_idx, 1]:.4f}, F_费={F[o_idx, 2]:.4f}\n")
-                    f.write(f"  本节点: X_工={X[o_idx, 1]:.4f}, X_费={X[o_idx, 2]:.4f}\n")
-                    f.write(f"  本节点: S_工={S[o_idx, 1]:.4f}, S_费={S[o_idx, 2]:.4f}\n")
-                    
-                    # 找出流入这个工单的材料
-                    incoming_mats = []
-                    for mat in self.material_nodes:
-                        m_idx = self.node_index[mat]
-                        if W[o_idx, m_idx] > 0.001:  # 材料→工单
-                            incoming_mats.append((mat, W[o_idx, m_idx], X[m_idx, 1], X[m_idx, 2], S[m_idx, 1], S[m_idx, 2]))
-                    
-                    if incoming_mats:
-                        f.write(f"  上游材料 ({len(incoming_mats)}个):\n")
-                        for mat, w, x_lab, x_oh, s_lab, s_oh in incoming_mats[:5]:
-                            f.write(f"    {mat}: W={w:.4f}, X_工={x_lab:.4f}, X_费={x_oh:.4f}, S_工={s_lab:.4f}, S_费={s_oh:.4f}\n")
-                    
-                    # 找出这个工单产出的产品
-                    outgoing_prods = []
-                    for prod in self.material_nodes:
-                        p_idx = self.node_index[prod]
-                        if W[p_idx, o_idx] > 0.001:  # 工单→产品
-                            outgoing_prods.append((prod, W[p_idx, o_idx], X[p_idx, 1], X[p_idx, 2], S[p_idx, 1], S[p_idx, 2]))
-                    
-                    if outgoing_prods:
-                        f.write(f"  下游产品 ({len(outgoing_prods)}个):\n")
-                        for prod, w, x_lab, x_oh, s_lab, s_oh in outgoing_prods[:5]:
-                            f.write(f"    {prod}: W={w:.4f}, X_工={x_lab:.4f}, X_费={x_oh:.4f}, S_工={s_lab:.4f}, S_费={s_oh:.4f}\n")
-            
             # 逐步结转法下的 WIP = W × (I-D) × S_材料
             wip_step_at_order = S_mat * I_minus_D  # (1-D) × S_材料
             WIP_step_col = W.dot(wip_step_at_order)
@@ -1347,47 +1412,6 @@ class CostCalculator:
         # 合并销售成本结果（如果有）
         if not sales_cost_df.empty:
             self.result['销售成本明细'] = sales_cost_df
-
-        with open(r'D:\桌面\公众号\成本核算系统\log\debug_cost.txt', 'w', encoding='utf-8') as f:
-            f.write("=== 成本调试报告 ===\n")
-            f.write(f"F矩阵总和: {np.sum(F):.2f}\n")
-            f.write(f"X矩阵总和: {np.sum(X):.2f}\n")
-            f.write(f"放大倍数: {np.sum(X)/np.sum(F):.2f}\n")
-            f.write("\n前10个节点成本:\n")
-            for i in range(min(10, len(self.all_nodes))):
-                f.write(f"{self.all_nodes[i]}: F={F[i]}, X={X[i]}\n")
-
-        with open(r'D:\桌面\公众号\成本核算系统\log\debug_w_matrix.txt', 'w', encoding='utf-8') as f:
-            f.write("=== W 矩阵列和检查 ===\n")
-            
-            col_sums = np.array(W.sum(axis=0)).flatten()
-            max_col = np.max(col_sums)
-            max_idx = np.argmax(col_sums)
-            
-            f.write(f"最大列和: {max_col:.4f} (应 ≤ 1.0)\n")
-            f.write(f"问题节点: {self.all_nodes[max_idx]}\n\n")
-            
-            # 列出所有列和 > 1 的节点
-            f.write("列和大于1的节点:\n")
-            for i in range(len(self.all_nodes)):
-                if col_sums[i] > 1.01:  # 允许1%误差
-                    f.write(f"{self.all_nodes[i]}: {col_sums[i]:.4f}\n")
-                    # 显示这一列的非零元素（谁领用了它）
-                    col = W[:, i].toarray().flatten()
-                    non_zero = np.where(col > 0.001)[0]
-                    f.write(f"  被领用情况:\n")
-                    for j in non_zero:
-                        f.write(f"    {self.all_nodes[j]}: {col[j]:.4f}\n")
-                    f.write("\n")
-            
-            # 检查是否有自环（对角线元素）
-            f.write("\n=== 对角线检查 ===\n")
-            diag = W.diagonal()
-            if np.any(diag > 0.001):
-                f.write("警告：存在自环！\n")
-                for i in range(len(self.all_nodes)):
-                    if diag[i] > 0.001:
-                        f.write(f"{self.all_nodes[i]}: {diag[i]:.4f}\n")
 
         return self.result
     
@@ -1652,6 +1676,23 @@ class CostCalculator:
     
     def get_performance(self):
         return self.performance_log
+
+
+def calculate_period(data_dict, finished_df=None, finished_map=None,
+                     calculate_step_method=False, calculate_super_restoration=False):
+    """对单月份数据执行成本核算"""
+    calc = CostCalculator()
+    calc.load_data(data_dict)
+    if finished_df is None and 'finished' in data_dict:
+        finished_df = data_dict['finished']
+    result = calc.calculate(
+        finished_df=finished_df,
+        finished_map=finished_map,
+        calculate_step_method=calculate_step_method,
+        calculate_super_restoration=calculate_super_restoration
+    )
+    return result, calc
+
 
 def to_excel(df_dict):
     output = BytesIO()

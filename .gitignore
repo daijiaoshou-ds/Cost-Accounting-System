@@ -26,4 +26,8 @@ lib/
 # 项目特定
 AGENTS.md
 theory.md
+theory4.0.md
+PLAN_4.0.md
 start.bat
+Cal_test.py
+skill_reference/
