@@ -110,6 +110,15 @@ class PipelineLog:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(self.summary())
 
+    def to_dict(self) -> dict:
+        """输出结构化 JSON，供 AI 直接读取解读"""
+        return {
+            "stage_times": dict(self.stage_times),
+            "metrics": dict(self.metrics),
+            "warnings": list(self.warnings),
+            "errors": list(self.errors),
+        }
+
 
 # ============================================================================
 # PipelineContext — 贯穿流水线的上下文
@@ -129,6 +138,7 @@ class PipelineContext:
 
     # S3 产出
     validation_passed: bool = False
+    validation: dict = field(default_factory=dict)  # 结构化校验结果
 
     # S4 产出
     monthly_calc: Dict[Tuple[int, int], CostCalculator] = field(default_factory=dict)
@@ -275,11 +285,33 @@ class CostPipeline:
             calc.load_data(sample_data)
             calc.calculate()  # 触发三道保险
         except ValueError as e:
-            ctx.log.error(f"矩阵校验失败: {e}")
+            error_msg = str(e)
+            ctx.log.error(f"矩阵校验失败: {error_msg}")
+            # 失败时也填充结构化 validation，让 AI 可以解读
+            n_nodes = len(calc.all_nodes) if hasattr(calc, 'all_nodes') and calc.all_nodes else 0
+            ctx.validation = {
+                "sample_month": f"{sample_key[0]}Y{sample_key[1]:02d}M",
+                "matrix_dimension": n_nodes,
+                "stage": "S3_matrix_build",
+                "passed": False,
+                "error_type": "ValueError",
+                "error_message": error_msg,
+                "W_col_sum_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
+                "self_loop_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
+                "D_range_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
+            }
             ctx.log.time_stage('S3_矩阵校验与日志', time.time() - t0)
             return ctx
         except Exception as e:
-            ctx.log.error(f"矩阵校验未知错误: {e}")
+            error_msg = str(e)
+            ctx.log.error(f"矩阵校验未知错误: {error_msg}")
+            ctx.validation = {
+                "sample_month": f"{sample_key[0]}Y{sample_key[1]:02d}M",
+                "stage": "S3_matrix_build",
+                "passed": False,
+                "error_type": type(e).__name__,
+                "error_message": error_msg,
+            }
             ctx.log.time_stage('S3_矩阵校验与日志', time.time() - t0)
             return ctx
 
@@ -300,7 +332,7 @@ class CostPipeline:
             ctx.log.warn(f"W 矩阵列和超过 1 的节点({len(bad_nodes)}个): {bad_nodes[:10]}")
             ctx.log.metric('stage3_超领节点数', len(bad_nodes))
         else:
-            ctx.log.metric('stage3_列和校验', '✅ 通过 (全部 ≤1)')
+            ctx.log.metric('stage3_列和校验', '通过 (全部 <=1)')
 
         # 保险2: DAG 无环
         diag = W.diagonal()
@@ -309,13 +341,13 @@ class CostPipeline:
             bad_nodes = [calc.all_nodes[i] for i in bad_idx]
             ctx.log.error(f"W 矩阵存在自环: {bad_nodes}")
         else:
-            ctx.log.metric('stage3_无环校验', '✅ 通过')
+            ctx.log.metric('stage3_无环校验', '通过')
 
         # 保险3: D 范围
         if np.any(D_mat < 0) or np.any(D_mat > 1):
             ctx.log.error("D 矩阵存在非法值 (不在 [0,1] 范围内)")
         else:
-            ctx.log.metric('stage3_D矩阵范围', '✅ 通过')
+            ctx.log.metric('stage3_D矩阵范围', '通过')
 
         # 统计信息
         nnz = W.nnz
@@ -323,9 +355,35 @@ class CostPipeline:
         ctx.log.metric('stage3_非零边数', nnz)
         ctx.log.metric('stage3_稀疏度', f"{sparsity:.4f}%")
 
-        # 输出日志文件
+        # ---- 结构化 validation 块 (供 AI 读取) ----
+        over_one_nodes = [calc.all_nodes[i] for i in over_one] if len(over_one) > 0 else []
+        ctx.validation = {
+            "sample_month": f"{sample_key[0]}Y{sample_key[1]:02d}M",
+            "matrix_dimension": n,
+            "W_max_col_sum": round(max_col, 6),
+            "W_col_sum_check": {
+                "passed": len(over_one) == 0,
+                "threshold": 1.0,
+                "over_one_nodes": over_one_nodes[:20],
+                "over_one_count": len(over_one),
+            },
+            "self_loop_check": {
+                "passed": not np.any(diag > 1e-6),
+                "self_loop_nodes": [calc.all_nodes[i] for i in np.where(diag > 1e-6)[0]] if np.any(diag > 1e-6) else [],
+            },
+            "D_range_check": {
+                "passed": not (np.any(D_mat < 0) or np.any(D_mat > 1)),
+                "min": round(float(np.min(D_mat)), 6),
+                "max": round(float(np.max(D_mat)), 6),
+            },
+            "nnz": int(nnz),
+            "sparsity_percent": round(sparsity, 4),
+        }
+
+        # 输出日志文件（默认跟随输出目录）
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(__file__), '..', 'log')
+        os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f'pipeline_validation_{sample_key[0]}Y{sample_key[1]:02d}M.txt')
         ctx.log.write_to_file(log_path)
         ctx.log.metric('stage3_日志文件', log_path)
@@ -382,6 +440,8 @@ class CostPipeline:
             total_nnz += nnz
 
             elapsed = time.time() - month_start
+            stage_key = f'S4_{year}Y{month:02d}M_核心矩阵运算'
+            ctx.log.time_stage(stage_key, elapsed)
             ctx.log.metric(f'stage4_{year}Y{month:02d}M_维度', n)
             ctx.log.metric(f'stage4_{year}Y{month:02d}M_非零边', nnz)
             ctx.log.metric(f'stage4_{year}Y{month:02d}M_耗时', f'{elapsed:.3f}s')

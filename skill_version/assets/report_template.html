@@ -168,7 +168,7 @@ document.getElementById('month-pair-stats').innerHTML = Object.entries(mps).map(
   `<div style="margin-bottom:10px;padding:10px;background:#f8f9ff;border-radius:8px;">
     <div style="font-weight:600;margin-bottom:4px;">${k}</div>
     <div style="font-size:0.85rem;color:#666;">
-      产品数: ${v['产品数']} | 上涨: ${v['上涨产品数']} | 下跌: ${v['下跌产品数']} | 均值: Y${fmt(v['平均变动金额'])}
+      产品数: ${v['产品数']} | 上涨: ${v['上涨产品数']} | 下跌: ${v['下跌产品数']} | 均值: Y${fmt(v['平均完工金额'])}
     </div></div>`
 ).join('');
 

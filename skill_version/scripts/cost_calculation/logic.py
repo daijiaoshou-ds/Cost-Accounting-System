@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import sys
 from io import BytesIO
 import time
 import warnings
@@ -17,11 +18,14 @@ def _read_excel(file):
         # 先用 polars 读
         df_pl = pl.read_excel(file)
         return df_pl.to_pandas()
-    except Exception:
+    except Exception as e1:
+        # 记录 Polars 读取失败原因，便于排查
+        print(f"[WARN] Polars 读取失败，回退 pandas: {e1}", file=sys.stderr)
         try:
             file.seek(0)
             return pd.read_excel(file)
-        except Exception:
+        except Exception as e2:
+            print(f"[WARN] pandas 默认引擎读取失败，回退 openpyxl: {e2}", file=sys.stderr)
             file.seek(0)
             return pd.read_excel(file, engine='openpyxl')
 
@@ -61,7 +65,7 @@ TABLE_SCHEMA = {
         'required': ['年度', '月份', '存货编码', '出库单号', '销售数量'],
         'rename': {'存货编码': '物料编码', '出库单号': '销售批次号'},
         'groupby': ['年度', '月份', '物料编码', '销售批次号'],
-        'agg': {'销售数量': 'sum'},
+        'agg': {'销售数量': 'sum', '销售金额': 'sum'},
         'optional': {'销售金额': 0},  # 可选，用于毛利率分析
     },
 }

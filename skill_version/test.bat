@@ -1,17 +1,11 @@
 @echo off
 pushd %~dp0scripts
-echo === Step 1: Core Calculation ===
-python pipeline_cli.py --config ../test_config.json --output-dir ../output
+echo === Phase 0: Environment Check ===
+python check_env.py --json
 echo.
-echo === Step 2: Cost Fluctuation ===
-python cost_fluctuation.py --output-dir ../output
+echo === Phase 1-5: Run All (skip env, already checked) ===
+python run_all.py --config ../test_config.json --output-dir ../output --skip-env
 echo.
-echo === Step 3: Margin Analysis ===
-python margin_analysis.py --output-dir ../output
-echo.
-echo === Step 4: Generate HTML Report ===
-python generate_report.py --output-dir ../output
-echo.
-echo === Done ===
+echo === Done. Opening report... ===
 start "" "..\output\cost_report.html"
 popd

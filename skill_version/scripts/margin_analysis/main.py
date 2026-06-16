@@ -147,11 +147,17 @@ def analyze_margin(output_dir: str) -> dict:
     # 1. 负毛利批次
     df_all['_margin'] = df_all['毛利']
     negative_margin = df_all[df_all['_margin'] < 0]
-    # 2. 毛利率异常低 (<5%)
-    df_all['_margin_pct'] = df_all.apply(
-        lambda r: r['_margin'] / r['销售金额'] if r['销售金额'] > 0 else None, axis=1
+    # 2. 毛利率异常低 (0 <= margin_pct < 5%)，不包含负毛利
+    df_all['_margin_pct'] = np.where(
+        df_all['销售金额'] > 0,
+        df_all['_margin'] / df_all['销售金额'],
+        np.nan
     )
-    low_margin = df_all[(df_all['_margin_pct'].notna()) & (df_all['_margin_pct'] < 0.05)]
+    low_margin = df_all[
+        (df_all['_margin_pct'].notna()) &
+        (df_all['_margin_pct'] >= 0) &
+        (df_all['_margin_pct'] < 0.05)
+    ]
 
     # ---- 产品线汇总 ----
     product_summary = []
@@ -189,7 +195,7 @@ def analyze_margin(output_dir: str) -> dict:
         "product_line_summary": product_summary,
         "anomalies": {
             "negative_margin_batches": len(negative_margin),
-            "low_margin_batches": len(low_margin) - len(negative_margin),
+            "low_margin_batches": len(low_margin),
             "negative_margin_details": negative_margin[[
                 '月份', '产品编码', '销售批次号', '销售金额', '销售成本', '毛利', '毛利率'
             ]].to_dict(orient='records') if len(negative_margin) > 0 else [],
@@ -211,6 +217,15 @@ def analyze_margin(output_dir: str) -> dict:
 # ============================================================================
 
 def main():
+    # 强制 UTF-8 输出，避免 Windows 终端中文乱码
+    import sys, io
+    if sys.platform == "win32":
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="销售毛利率分析")
     parser.add_argument("--output-dir", type=str, default="./output",
                         help="pipeline 输出目录 (默认 ./output)")
