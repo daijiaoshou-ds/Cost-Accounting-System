@@ -268,29 +268,30 @@ def create_edge_table(calc):
             return None
         W = calc.W_matrix
         all_nodes = calc.all_nodes
-        material_nodes = calc.material_nodes
-        order_nodes = calc.order_nodes
+        order_nodes = set(calc.order_nodes)
         rows = []
         edge_id = 0
         W_coo = W.tocoo()
+
+        def _is_mat(node):
+            return node.endswith('#车间') or node.endswith('#仓库')
+
         for i, j, w in zip(W_coo.row, W_coo.col, W_coo.data):
             if w > 0.001:
                 edge_id += 1
                 source = all_nodes[j]
                 target = all_nodes[i]
                 weight = float(w)
-                is_material_to_order = (source in material_nodes) and (target in order_nodes)
-                is_order_to_material = (source in order_nodes) and (target in material_nodes)
-                consume_ratio = f"{weight:.2%}" if is_material_to_order else "—"
-                output_ratio = f"{weight:.2%}" if is_order_to_material else "—"
+                is_mat2order = _is_mat(source) and (target in order_nodes)
+                is_order2mat = (source in order_nodes) and _is_mat(target)
                 rows.append({
                     '边ID': f"E{edge_id:03d}",
                     '起点': source,
                     '起点类型': '工单' if source in order_nodes else '物料',
                     '终点': target,
                     '终点类型': '工单' if target in order_nodes else '物料',
-                    '消耗比例': consume_ratio,
-                    '产出比例': output_ratio,
+                    '消耗比例': f"{weight:.2%}" if is_mat2order else "—",
+                    '产出比例': f"{weight:.2%}" if is_order2mat else "—",
                 })
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
@@ -304,8 +305,12 @@ def create_path_table(calc):
             return None
         W = calc.W_matrix
         all_nodes = calc.all_nodes
-        material_nodes = calc.material_nodes
-        order_nodes = calc.order_nodes
+        order_nodes = set(calc.order_nodes)
+
+        def _is_mat(node):
+            return node.endswith('#车间') or node.endswith('#仓库')
+
+        mat_nodes_all = [n for n in all_nodes if _is_mat(n)]
 
         out_edges = {node: [] for node in all_nodes}
         in_edges = {node: [] for node in all_nodes}
@@ -321,10 +326,10 @@ def create_path_table(calc):
                 in_edges[target].append(source)
                 edge_weight[(source, target)] = weight
 
-        roots = [node for node in material_nodes if not in_edges[node]]
+        roots = [node for node in mat_nodes_all if not in_edges.get(node)]
         if not roots:
-            roots = list(material_nodes)
-        leaves = [node for node in material_nodes if not out_edges[node]]
+            roots = mat_nodes_all
+        leaves = [node for node in mat_nodes_all if not out_edges.get(node)]
 
         all_paths = []
 
@@ -352,7 +357,7 @@ def create_path_table(calc):
                 row[f'第{i}层'] = path[i - 1] if i <= len(path) else ''
             final_product = None
             for node in reversed(path):
-                if node in material_nodes:
+                if _is_mat(node):
                     final_product = node
                     break
             row['最终成品'] = final_product if final_product else path[-1]
@@ -639,17 +644,18 @@ def render_cost_accounting():
         st.warning("⚠️ 请至少上传【采购入库明细】和【投入产出明细】文件")
         return
 
-    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns([1, 1, 1, 1])
+    col_opt1, col_opt2, col_opt3 = st.columns([1, 1, 1])
     with col_opt1:
         calculate_step_method = st.checkbox("📊 逐步结转法", value=False)
     with col_opt2:
-        calculate_super_restoration = st.checkbox("🔬 超级成本还原", value=False)
-    with col_opt3:
         force_calculate = st.checkbox("⚠️ 强制计算", value=False,
-            help="超领物料自动归一化至1.0，单价乘以矫正系数")
-    with col_opt4:
-        debug_mode = st.checkbox("🔍 调试日志", value=False,
-            help="输出debug_logs/log_{year}Y{month}M.txt")
+            help="超领物料自动归一化至1.0")
+    with col_opt3:
+        do_super = st.checkbox("🔬 超级成本还原", value=False,
+            help="对完工成本最大的前N个产品做成本维度拆解")
+    top_n = 20
+    if do_super:
+        top_n = st.number_input("还原 Top N 产品", min_value=1, max_value=500, value=20)
 
     if st.button("🚀 执行成本核算", type="primary", use_container_width=True):
         with st.spinner("正在读取并聚合数据..."):
@@ -686,7 +692,6 @@ def render_cost_accounting():
                     calc.load_data(monthly_data[(year, month)])
                     result = calc.calculate(
                         calculate_step_method=calculate_step_method,
-                        calculate_super_restoration=calculate_super_restoration,
                         force_calculate=force_calculate
                     )
                     total_time = time.time() - start
@@ -698,18 +703,46 @@ def render_cost_accounting():
 
                     progress_bar.progress((i + 1) / len(all_months))
 
-                # 调试日志输出
-                if debug_mode:
-                    import os
-                    log_dir = "debug_logs"
-                    os.makedirs(log_dir, exist_ok=True)
-                    for (year, month), calc in st.session_state.monthly_calc.items():
-                        log_path = os.path.join(log_dir, f"log_{year}Y{month:02d}M.txt")
-                        try:
-                            write_debug_log(calc, log_path)
-                        except Exception as log_e:
-                            st.warning(f"调试日志写入失败 ({year}年{month}月): {log_e}")
-                    st.caption(f"调试日志已输出到 debug_logs/")
+                # 调试日志（默认输出）
+                import os
+                log_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
+                os.makedirs(log_dir, exist_ok=True)
+                for (year, month), calc in st.session_state.monthly_calc.items():
+                    log_path = os.path.join(log_dir, f"log_{year}Y{month:02d}M.txt")
+                    try:
+                        write_debug_log(calc, log_path)
+                    except Exception:
+                        pass  # 日志写入失败不影响主流程
+
+                # 超级成本还原（勾选后自动执行）
+                if do_super and top_n > 0:
+                    # 跨月汇总：从工单明细聚合完工产品成本（料+工+费）
+                    all_prod_cost = {}
+                    for (year, month), result in st.session_state.monthly_results.items():
+                        detail = result.get('工单明细', pd.DataFrame())
+                        if detail.empty:
+                            continue
+                        for _, row in detail.iterrows():
+                            prod = row['产品编码']
+                            cost = (row.get('完工产品材料费', 0) + row.get('完工产品直接人工', 0)
+                                    + row.get('完工产品制造费用', 0))
+                            all_prod_cost[prod] = all_prod_cost.get(prod, 0) + cost
+
+                    if not all_prod_cost:
+                        st.warning("未找到工单明细数据，无法进行超级还原")
+                    else:
+                        total_all = sum(all_prod_cost.values())
+                        top_items = sorted(all_prod_cost.items(), key=lambda x: x[1], reverse=True)[:top_n]
+                        top_products = [m for m, _ in top_items]
+                        top_sum = sum(c for _, c in top_items)
+
+                        status_text.text(f"正在超级成本还原 (前{len(top_products)}大产品, 占{top_sum/total_all*100:.1f}%)...")
+                        for (year, month), calc in st.session_state.monthly_calc.items():
+                            try:
+                                sr = calc.super_restore(top_products=top_products, force_calculate=force_calculate)
+                                st.session_state.monthly_results[(year, month)].update(sr)
+                            except Exception as e:
+                                st.warning(f"超级还原失败 ({year}年{month}月): {e}")
 
                 status_text.text(f"✅ 全部 {len(all_months)} 个月计算完成！")
                 st.session_state.calculation_done = True

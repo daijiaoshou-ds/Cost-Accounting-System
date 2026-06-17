@@ -34,3 +34,7 @@ skill_reference/
 
 # skill_version特定
 skill_version/docs/
+
+# streamlit_version特定
+streamlit_version/docs/
+streamlit_version/debug_logs/
