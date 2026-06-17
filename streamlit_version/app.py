@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from logic import CostCalculator, to_excel, load_and_aggregate, TABLE_SCHEMA
+from logic import CostCalculator, to_excel, load_and_aggregate, TABLE_SCHEMA, write_debug_log
 import time
 import re
 from io import BytesIO
@@ -58,7 +58,7 @@ st.markdown("""
 
 # ==================== 必要字段声明 ====================
 TABLE_REQUIRED_FIELDS = {
-    'initial': ['年度', '月份', '存货编码', '数量', '直接材料', '直接人工', '制造费用'],
+    'initial': ['年度', '月份', '存货编码', '数量', '直接材料', '直接人工', '制造费用', '库存类型'],
     'purchase': ['年度', '月份', '存货编码', '采购数量', '采购金额'],
     'labor': ['年度', '月份', '工单号', '直接人工', '制造费用'],
     'io': ['年度', '月份', '工单号', '产品编码', '材料编码', '领用数量', '完工数量', '在产数量'],
@@ -122,6 +122,8 @@ def smart_match(columns, file_type):
                        (r'期初.*人工$', 8), (r'人工金额', 7)],
             '制造费用': [(r'制造费用$', 10), (r'^制费$', 9), (r'间接费用', 7),
                        (r'期初.*制费$', 8), (r'制造成本', 6)],
+            '库存类型': [(r'库存类型$', 10), (r'库别$', 9), (r'库存类别', 8),
+                       (r'仓库类型$', 8), (r'存储位置', 7), (r'库位', 6)],
         },
         'purchase': {
             '年度': [(r'^年度$', 10), (r'^年$', 9), (r'year', 8)],
@@ -637,11 +639,17 @@ def render_cost_accounting():
         st.warning("⚠️ 请至少上传【采购入库明细】和【投入产出明细】文件")
         return
 
-    col_opt1, col_opt2 = st.columns([1, 1])
+    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns([1, 1, 1, 1])
     with col_opt1:
-        calculate_step_method = st.checkbox("📊 计算逐步结转法", value=False)
+        calculate_step_method = st.checkbox("📊 逐步结转法", value=False)
     with col_opt2:
         calculate_super_restoration = st.checkbox("🔬 超级成本还原", value=False)
+    with col_opt3:
+        force_calculate = st.checkbox("⚠️ 强制计算", value=False,
+            help="超领物料自动归一化至1.0，单价乘以矫正系数")
+    with col_opt4:
+        debug_mode = st.checkbox("🔍 调试日志", value=False,
+            help="输出debug_logs/log_{year}Y{month}M.txt")
 
     if st.button("🚀 执行成本核算", type="primary", use_container_width=True):
         with st.spinner("正在读取并聚合数据..."):
@@ -678,7 +686,8 @@ def render_cost_accounting():
                     calc.load_data(monthly_data[(year, month)])
                     result = calc.calculate(
                         calculate_step_method=calculate_step_method,
-                        calculate_super_restoration=calculate_super_restoration
+                        calculate_super_restoration=calculate_super_restoration,
+                        force_calculate=force_calculate
                     )
                     total_time = time.time() - start
 
@@ -688,6 +697,19 @@ def render_cost_accounting():
                     st.session_state.monthly_calc[(year, month)] = calc
 
                     progress_bar.progress((i + 1) / len(all_months))
+
+                # 调试日志输出
+                if debug_mode:
+                    import os
+                    log_dir = "debug_logs"
+                    os.makedirs(log_dir, exist_ok=True)
+                    for (year, month), calc in st.session_state.monthly_calc.items():
+                        log_path = os.path.join(log_dir, f"log_{year}Y{month:02d}M.txt")
+                        try:
+                            write_debug_log(calc, log_path)
+                        except Exception as log_e:
+                            st.warning(f"调试日志写入失败 ({year}年{month}月): {log_e}")
+                    st.caption(f"调试日志已输出到 debug_logs/")
 
                 status_text.text(f"✅ 全部 {len(all_months)} 个月计算完成！")
                 st.session_state.calculation_done = True

@@ -29,9 +29,14 @@ def _read_excel(file):
 TABLE_SCHEMA = {
     'initial': {
         'required': ['年度', '月份', '存货编码', '数量', '直接材料', '直接人工', '制造费用'],
-        'rename': {'存货编码': '物料编码', '数量': '期初数量', '直接材料': '期初材料', '直接人工': '期初人工', '制造费用': '期初制费'},
-        'groupby': ['年度', '月份', '物料编码'],
+        'rename': {
+            '存货编码': '物料编码', '数量': '期初数量',
+            '直接材料': '期初材料', '直接人工': '期初人工', '制造费用': '期初制费',
+            '库存类型': '库存类型',
+        },
+        'groupby': ['年度', '月份', '物料编码', '库存类型'],
         'agg': {'期初数量': 'sum', '期初材料': 'sum', '期初人工': 'sum', '期初制费': 'sum'},
+        'optional': {'库存类型': '仓库'},
     },
     'purchase': {
         'required': ['年度', '月份', '存货编码', '采购数量', '采购金额'],
@@ -89,27 +94,44 @@ def load_and_aggregate(file_dict, mapping_dict):
         groupby = schema['groupby']
         agg = schema['agg']
         
+        optional = schema.get('optional', {})
+
         file = file_dict.get(table)
         if file is None:
             internal_cols = [rename.get(c, c) for c in required if c not in ('年度', '月份')]
             internal_cols = list(dict.fromkeys(internal_cols))
+            # 包含 optional 字段
+            for opt_field in optional.keys():
+                opt_internal = rename.get(opt_field, opt_field)
+                if opt_internal not in internal_cols:
+                    internal_cols.append(opt_internal)
             df = pd.DataFrame(columns=internal_cols)
         else:
             df = _read_excel(file)
             col_map = mapping_dict.get(table, {})
             df = df.rename(columns=col_map)
-            
+
             missing = [c for c in required if c not in df.columns]
             if missing:
                 raise ValueError(f"表 {table} 缺少必要字段: {missing}")
-            
+
             df = df.rename(columns=rename)
+            # 构建 internal_cols：required + optional 中实际存在的列
             internal_cols = [rename.get(c, c) for c in required]
             internal_cols = list(dict.fromkeys(internal_cols))
+            for opt_field in optional.keys():
+                opt_internal = rename.get(opt_field, opt_field)
+                if opt_internal in df.columns and opt_internal not in internal_cols:
+                    internal_cols.append(opt_internal)
             df = df[internal_cols].copy()
+            # 缺失的 optional 字段用默认值填充
+            for opt_field, default_val in optional.items():
+                opt_internal = rename.get(opt_field, opt_field)
+                if opt_internal not in df.columns:
+                    df[opt_internal] = default_val
         
         # 字符串字段去空格
-        str_cols = [c for c in df.columns if '编码' in c or c in ('工单号', '销售批次号')]
+        str_cols = [c for c in df.columns if '编码' in c or '类型' in c or c in ('工单号', '销售批次号')]
         for c in str_cols:
             if c in df.columns:
                 df[c] = df[c].astype(str).str.strip()
@@ -137,25 +159,31 @@ def load_and_aggregate(file_dict, mapping_dict):
         else:
             result.setdefault((0, 0), {})[table] = df.reset_index(drop=True)
     
-    # 确保每个月份都包含所有表
+    # 确保每个月份都包含所有表（含 optional 字段）
     all_tables = list(TABLE_SCHEMA.keys())
     all_keys = list(result.keys())
+
+    def _build_internal_cols(schema):
+        internal_cols = [schema['rename'].get(c, c) for c in schema['required'] if c not in ('年度', '月份')]
+        internal_cols = list(dict.fromkeys(internal_cols))
+        for opt_field in schema.get('optional', {}).keys():
+            opt_internal = schema['rename'].get(opt_field, opt_field)
+            if opt_internal not in internal_cols:
+                internal_cols.append(opt_internal)
+        return internal_cols
+
     for key in all_keys:
         for table in all_tables:
             if table not in result[key]:
                 schema = TABLE_SCHEMA[table]
-                internal_cols = [schema['rename'].get(c, c) for c in schema['required'] if c not in ('年度', '月份')]
-                internal_cols = list(dict.fromkeys(internal_cols))
-                result[key][table] = pd.DataFrame(columns=internal_cols)
+                result[key][table] = pd.DataFrame(columns=_build_internal_cols(schema))
 
     # 如果没有找到任何月份数据（所有表都无年度/月份字段），返回默认键
     if not result:
         result[(0, 0)] = {}
         for table in all_tables:
             schema = TABLE_SCHEMA[table]
-            internal_cols = [schema['rename'].get(c, c) for c in schema['required'] if c not in ('年度', '月份')]
-            internal_cols = list(dict.fromkeys(internal_cols))
-            result[(0, 0)][table] = pd.DataFrame(columns=internal_cols)
+            result[(0, 0)][table] = pd.DataFrame(columns=_build_internal_cols(schema))
 
     return result
 
@@ -172,16 +200,27 @@ class CostCalculator:
         self.performance_log = {}
         
         # 保存中间计算结果
-        self.W_matrix = None
-        self.F_matrix = None  # 原始外部投入矩阵
-        self.D_matrix = None  # 阀门矩阵
+        self.W_matrix = None           # (兼容旧接口) 仓库W矩阵
+        self.W_workshop = None         # 车间W矩阵
+        self.W_warehouse = None        # 仓库W矩阵
+        self.F_matrix = None           # (兼容旧接口) 原始外部投入矩阵
+        self.F_workshop = None         # 车间F矩阵
+        self.F_warehouse = None        # 仓库F矩阵
+        self.D_matrix = None           # 阀门矩阵
         self.all_nodes = None
         self.material_nodes = None
         self.order_nodes = None
         self.node_index = None
-        self.X_total = None  # 总成本矩阵
-        self.available_qty = None  # 可供发出数量（W矩阵用，材料完工口径）
+        self.X_total = None            # 总成本矩阵
+        self.available_qty = None      # 可供发出数量（W矩阵用，材料完工口径）
         self.sales_available_qty = None  # 可供发出数量（销售用，产品完工口径）
+
+        # 双矩阵调试状态
+        self._self_loop_skipped = []       # 自环跳过记录
+        self._force_normalized = False     # 是否触发强制计算归一化
+        self._force_normalization_log = [] # 归一化详情 [{node, col_sum, correction_factor}]
+        self._workshop_consumed = {}       # {material: total_from_workshop}
+        self._warehouse_consumed = {}      # {material: total_from_warehouse}
         
     def load_data(self, data_dict):
         """
@@ -198,19 +237,24 @@ class CostCalculator:
         """
         start_time = time.time()
         
-        # 期初（可选）
+        # 期初（可选），按 物料编码+库存类型 分组保留仓库/车间区分
         df_init = data_dict.get('initial', pd.DataFrame())
         if df_init.empty:
-            self.initial_df = pd.DataFrame(columns=['物料编码', '期初数量', '期初材料', '期初人工', '期初制费'])
+            self.initial_df = pd.DataFrame(columns=['物料编码', '库存类型', '期初数量', '期初材料', '期初人工', '期初制费'])
         else:
             df_init = df_init.copy()
             df_init['物料编码'] = df_init['物料编码'].astype(str).str.strip()
+            # 确保 库存类型 列存在
+            if '库存类型' not in df_init.columns:
+                df_init['库存类型'] = '仓库'
+            else:
+                df_init['库存类型'] = df_init['库存类型'].astype(str).str.strip()
             for col in ['期初数量', '期初材料', '期初人工', '期初制费']:
                 if col in df_init.columns:
                     df_init[col] = pd.to_numeric(df_init[col], errors='coerce').fillna(0)
                 else:
                     df_init[col] = 0
-            self.initial_df = df_init.groupby('物料编码').agg({
+            self.initial_df = df_init.groupby(['物料编码', '库存类型']).agg({
                 '期初数量': 'sum',
                 '期初材料': 'sum',
                 '期初人工': 'sum',
@@ -287,11 +331,13 @@ class CostCalculator:
         self.performance_log['数据清洗'] = time.time() - start_time
         return True
     
-    def calculate(self, finished_df=None, finished_map=None, calculate_step_method=False, calculate_super_restoration=False):
-        """执行核心成本计算（修正版）
-        
-        Parameters:
-        -----------
+    def calculate(self, finished_df=None, finished_map=None,
+                  calculate_step_method=False, calculate_super_restoration=False,
+                  force_calculate=False):
+        """执行核心成本计算（双矩阵版：车间+仓库分离核算）
+
+        Parameters
+        ----------
         finished_df : DataFrame, optional
             产成品入库明细表，包含产品编码和入库数量
         finished_map : dict, optional
@@ -300,88 +346,113 @@ class CostCalculator:
             是否计算逐步结转法（平行结转法的补充），默认为False
         calculate_super_restoration : bool, optional
             是否计算超级成本还原，默认为False
+        force_calculate : bool, optional
+            是否强制计算（超领时自动归一化，而非报错），默认为False
         """
         # 稀疏矩阵模块已在文件顶部导入
-        
+
         # 若未传入 finished_df，优先使用 load_data 中保存的 finished 数据
         if finished_df is None and self.finished_df is not None:
             finished_df = self.finished_df
-        
+
         total_start = time.time()
-        
+
+        # 重置调试状态
+        self._self_loop_skipped = []
+        self._force_normalized = False
+        self._force_normalization_log = []
+        self._workshop_consumed = {}
+        self._warehouse_consumed = {}
+
         # Step 1: 构建节点
         t0 = time.time()
         products = set(self.io_df['产品编码'].unique())
         materials = set(self.io_df['材料编码'].unique())
         init_materials = set(self.initial_df['物料编码'].unique())
         pur_materials = set(self.purchase_df['物料编码'].unique())
-        
+
         all_materials = products | materials | init_materials | pur_materials
         all_orders = set(self.io_df['工单号'].unique())
-        
+
         self.material_nodes = sorted(list(all_materials))
         self.order_nodes = sorted(list(all_orders))
         self.all_nodes = self.material_nodes + self.order_nodes
         n = len(self.all_nodes)
-        
+
         self.node_index = {node: i for i, node in enumerate(self.all_nodes)}
         self.performance_log['构建节点'] = time.time() - t0
-        
-        # Step 2: 计算基础数量
+
+        # ============================================================
+        # Step 2: 计算基础数量（车间/仓库分离）
+        # ============================================================
         t0 = time.time()
-        
-        # 期初数据
-        init_qty = {}
-        init_amt_mat = {}
+
+        # --- 2a. 采购数据 ---
+        pur_qty = {}
+        pur_amt = {}
+        for mat in self.material_nodes:
+            pur_qty[mat] = 0
+            pur_amt[mat] = 0
+        for _, row in self.purchase_df.iterrows():
+            mat = str(row['物料编码'])
+            if mat in pur_qty:
+                pur_qty[mat] += row['采购数量']
+                pur_amt[mat] += row['采购金额']
+
+        # --- 2b. 期初数据：按库存类型分离 ---
+        workshop_init_qty = {}
+        workshop_init_mat = {}
+        warehouse_init_qty = {}
+        warehouse_init_mat = {}
+        # 注：init_amt_lab/init_amt_oh 保留用于报表展示，但不进F矩阵（工费在车间F的工单侧）
         init_amt_lab = {}
         init_amt_oh = {}
         for mat in self.material_nodes:
-            init_qty[mat] = 0
-            init_amt_mat[mat] = 0
+            workshop_init_qty[mat] = 0
+            workshop_init_mat[mat] = 0
+            warehouse_init_qty[mat] = 0
+            warehouse_init_mat[mat] = 0
             init_amt_lab[mat] = 0
             init_amt_oh[mat] = 0
 
         for _, row in self.initial_df.iterrows():
             mat = str(row['物料编码'])
-            if mat in init_qty:
-                init_qty[mat] = row['期初数量']
-                init_amt_mat[mat] = row.get('期初材料', 0)
-                init_amt_lab[mat] = row.get('期初人工', 0)
-                init_amt_oh[mat] = row.get('期初制费', 0)
-        
-        # 采购数据
-        pur_qty = {}
+            inv_type = str(row.get('库存类型', '仓库')).strip()
+            if mat in workshop_init_qty:
+                if inv_type == '车间':
+                    workshop_init_qty[mat] += row['期初数量']
+                    workshop_init_mat[mat] += row.get('期初材料', 0)
+                else:
+                    warehouse_init_qty[mat] += row['期初数量']
+                    warehouse_init_mat[mat] += row.get('期初材料', 0)
+                init_amt_lab[mat] += row.get('期初人工', 0)
+                init_amt_oh[mat] += row.get('期初制费', 0)
+
+        # 兼容旧接口：init_qty = 仓库+车间期初合计（供报表 display_qty 使用）
+        init_qty = {}
+        init_amt_mat = {}
         for mat in self.material_nodes:
-            pur_qty[mat] = 0
-        
-        for _, row in self.purchase_df.iterrows():
-            mat = str(row['物料编码'])
-            if mat in pur_qty:
-                pur_qty[mat] = row['采购数量']
-        
-        # 生产数据（完工+在产）
-        # 【重要区分】
-        # 1. finished_qty_for_w: 用于W矩阵计算（必须来自投入产出明细）
-        # 2. finished_qty_for_report: 用于收发存报表（来自入库明细，如果提供）
-        
-        finished_qty_for_w = {}  # 用于W矩阵
-        finished_qty_for_report = {}  # 用于报表
+            init_qty[mat] = warehouse_init_qty[mat] + workshop_init_qty[mat]
+            init_amt_mat[mat] = warehouse_init_mat[mat] + workshop_init_mat[mat]
+
+        # --- 2c. 生产数据（完工+在产） ---
+        finished_qty_for_w = {}
+        finished_qty_for_report = {}
         wip_qty = {}
-        
-        # 初始化
+
         for mat in self.material_nodes:
             finished_qty_for_w[mat] = 0
             finished_qty_for_report[mat] = 0
             wip_qty[mat] = 0
-        
-        # 1. W矩阵的完工数量：始终从投入产出获取
+
+        # W矩阵的完工数量：始终从投入产出获取
         prod_summary = self.io_df.groupby('产品编码')['产品完工数量'].sum().reset_index()
         for _, row in prod_summary.iterrows():
             mat = str(row['产品编码'])
             if mat in finished_qty_for_w:
                 finished_qty_for_w[mat] = row['产品完工数量']
-        
-        # 2. 报表的完工数量：优先从入库明细获取，否则用投入产出
+
+        # 报表的完工数量：优先从入库明细获取，否则用投入产出
         if finished_df is not None and not finished_df.empty:
             df_fin = finished_df.copy()
             if finished_map:
@@ -392,188 +463,298 @@ class CostCalculator:
             for mat in self.material_nodes:
                 finished_qty_for_report[mat] = fin_summary.get(mat, 0)
         else:
-            # 没有入库明细，用投入产出的
             for mat in self.material_nodes:
                 finished_qty_for_report[mat] = finished_qty_for_w[mat]
-        
+
         # 在产品数量从投入产出获取
         wip_summary = self.io_df.groupby('产品编码')['在产品数量'].sum().reset_index()
         for _, row in wip_summary.iterrows():
             mat = str(row['产品编码'])
             if mat in wip_qty:
                 wip_qty[mat] = row['在产品数量']
-        
+
+        # --- 2d. 可供发出数量（双口径） ---
+        # 车间可供发出 = 车间期初数量（只有期初WIP，不含采购/完工）
+        workshop_avail = {}
+        for mat in self.material_nodes:
+            workshop_avail[mat] = workshop_init_qty[mat]
+
+        # 仓库可供发出 = 仓库期初 + 采购 + 完工
+        warehouse_avail = {}
+        for mat in self.material_nodes:
+            warehouse_avail[mat] = warehouse_init_qty[mat] + pur_qty[mat] + finished_qty_for_w[mat]
+
+        # 销售用可供（仓库口径 + 报表完工数量）
+        sales_available_qty = {}
+        for mat in self.material_nodes:
+            sales_available_qty[mat] = warehouse_init_qty[mat] + workshop_init_qty[mat] + pur_qty[mat] + finished_qty_for_report[mat]
+
         self.performance_log['计算数量'] = time.time() - t0
         
-        # Step 3: 构建W矩阵
+        # ============================================================
+        # Step 3: 构建双W矩阵（车间 + 仓库）
+        #   产出边：两矩阵共用相同的 order→product 比例
+        #   消耗边：先来后到 — 先消耗车间库存，不够再走仓库
+        # ============================================================
         t0 = time.time()
-        row_indices = []
-        col_indices = []
-        data = []
-        
-        # 可供发出数量 = 期初 + 采购 + 完工（W矩阵用投入产出的完工数量）
-        available_qty = {}
-        for mat in self.material_nodes:
-            available_qty[mat] = init_qty[mat] + pur_qty[mat] + finished_qty_for_w[mat]
-        
-        # 按工单+产品聚合完工数量（避免重复）
-        order_prod_finished = self.io_df.groupby(['工单号', '产品编码'])['产品完工数量'].sum().reset_index()
 
-        # 计算每个工单的总完工数量
+        # --- 3a. 产出边（两矩阵共用）---
+        order_prod_finished = self.io_df.groupby(['工单号', '产品编码'])['产品完工数量'].sum().reset_index()
         order_total_finished = order_prod_finished.groupby('工单号')['产品完工数量'].sum()
 
-        # 构建产出关系（按完工数量比例分配）
+        out_rows, out_cols, out_data = [], [], []
         for _, row in order_prod_finished.iterrows():
             order = str(row['工单号'])
             prod = str(row['产品编码'])
             finished = row['产品完工数量']
-            
             if order not in self.node_index or prod not in self.node_index:
                 continue
-            
-            # 产出比例 = 该产品完工数量 / 工单总完工数量
             total = order_total_finished.get(order, 0)
             if total > 0:
                 ratio = finished / total
             else:
-                # 如果总完工为0，平均分配（或根据业务逻辑处理）
-                n_products = len(order_prod_finished[order_prod_finished['工单号']==order])
+                n_products = len(order_prod_finished[order_prod_finished['工单号'] == order])
                 ratio = 1.0 / n_products if n_products > 0 else 0
-            
-            row_indices.append(self.node_index[prod])
-            col_indices.append(self.node_index[order])
-            data.append(ratio)  # 分摊比例，不是1.0！
-        
-        # 物料→工单（消耗）
-        for _, row in self.io_df.iterrows():
-            order = str(row['工单号'])
-            material = str(row['材料编码'])
-            issue = row['材料领用数量']
-            
-            if material not in self.node_index or order not in self.node_index:
-                continue
-            
-            avail = available_qty.get(material, 0)
-            if avail > 0:
-                ratio = issue / avail
-                if ratio > 1:
-                    ratio = 1.0
-            else:
-                ratio = 0
-            
-            row_indices.append(self.node_index[order])
-            col_indices.append(self.node_index[material])
-            data.append(ratio)
-        
-        W = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
-        self.W_matrix = W
-        
-        # ========== 三道保险（Release必备）==========
-        # 保险1：列和校验（防超领导致成本发散）
-        col_sums = np.array(W.sum(axis=0)).flatten()
-        if np.any(col_sums > 1 + 1e-6):
-            bad_nodes = [self.all_nodes[i] for i in np.where(col_sums > 1)[0]]
-            raise ValueError(f"以下物料存在超领（领用>可供发出），成本将扭曲：{bad_nodes}")
-        
-        # 保险2：DAG无环校验（防自循环导致矩阵不可逆）
-        diag = W.diagonal()
-        if np.any(diag > 1e-6):
-            bad_nodes = [self.all_nodes[i] for i in np.where(diag > 1e-6)[0]]
-            raise ValueError(f"W矩阵存在自环（如工单领用自己产出的物料），节点：{bad_nodes}")
-        
-        self.performance_log['构建矩阵'] = time.time() - t0
-        
-        # 保存可供发出数量
-        self.available_qty = available_qty  # W矩阵用：期初 + 采购 + 材料完工数量
-        
-        # 销售用可供发出数量：期初 + 采购 + 产品完工数量（报表口径）
-        sales_available_qty = {}
+            out_rows.append(self.node_index[prod])
+            out_cols.append(self.node_index[order])
+            out_data.append(ratio)
+
+        # --- 3b. 消耗边：先来后到 ---
+        ws_rows, ws_cols, ws_data = [], [], []   # W_workshop
+        wh_rows, wh_cols, wh_data = [], [], []   # W_warehouse
+        remaining_ws = workshop_init_qty.copy()
+        self._workshop_consumed = {}
+        self._warehouse_consumed = {}
+
         for mat in self.material_nodes:
-            sales_available_qty[mat] = init_qty[mat] + pur_qty[mat] + finished_qty_for_report[mat]
+            ws_avail = workshop_avail.get(mat, 0)
+            wh_avail = warehouse_avail.get(mat, 0)
+            total_ws_consume = 0.0
+            total_wh_consume = 0.0
+            # 按IO原始行序遍历（用户数据有时间顺序）
+            mat_io = self.io_df[self.io_df['材料编码'] == mat]
+
+            for _, row in mat_io.iterrows():
+                order = str(row['工单号'])
+                prod_in_row = str(row['产品编码'])
+                issue = row['材料领用数量']
+
+                if order not in self.node_index:
+                    continue
+
+                # 2-hop 自环检测：材料编码 == 产品编码 → 跳过消费边
+                if mat == prod_in_row:
+                    self._self_loop_skipped.append({
+                        'order': order, 'material': mat, 'product': prod_in_row,
+                        'type': '2hop_self_loop', 'issue_qty': float(issue),
+                    })
+                    continue
+
+                # 先来后到：优先消耗车间库存
+                from_ws = min(issue, remaining_ws.get(mat, 0))
+                remaining_ws[mat] = remaining_ws.get(mat, 0) - from_ws
+                from_wh = issue - from_ws
+
+                total_ws_consume += from_ws
+                total_wh_consume += from_wh
+
+                if ws_avail > 0 and from_ws > 0:
+                    ws_rows.append(self.node_index[order])
+                    ws_cols.append(self.node_index[mat])
+                    ws_data.append(from_ws / ws_avail)
+
+                if wh_avail > 0 and from_wh > 0:
+                    wh_rows.append(self.node_index[order])
+                    wh_cols.append(self.node_index[mat])
+                    wh_data.append(from_wh / wh_avail)
+
+            self._workshop_consumed[mat] = total_ws_consume
+            self._warehouse_consumed[mat] = total_wh_consume
+
+        # --- 3c. 组装两个W矩阵 ---
+        W_workshop = sparse.csr_matrix(
+            (out_data + ws_data, (out_rows + ws_rows, out_cols + ws_cols)), shape=(n, n))
+        W_warehouse = sparse.csr_matrix(
+            (out_data + wh_data, (out_rows + wh_rows, out_cols + wh_cols)), shape=(n, n))
+
+        self.W_workshop = W_workshop
+        self.W_warehouse = W_warehouse
+        self.W_matrix = W_warehouse  # 兼容旧接口
+
+        # --- 3d. 校验 ---
+        col_sums_ws = np.array(W_workshop.sum(axis=0)).flatten()
+        col_sums_wh = np.array(W_warehouse.sum(axis=0)).flatten()
+
+        # 车间列和 ≤ 1 自然保证，浮点溢出做归一化兜底
+        ws_over = np.where(col_sums_ws > 1 + 1e-6)[0]
+        if len(ws_over) > 0:
+            W_ws_csc = W_workshop.tocsc()
+            for j in ws_over:
+                cs = float(col_sums_ws[j])
+                scale = 1.0 / cs
+                start = W_ws_csc.indptr[j]
+                end = W_ws_csc.indptr[j + 1]
+                W_ws_csc.data[start:end] *= scale
+            W_workshop = W_ws_csc.tocsr()
+            self.W_workshop = W_workshop
+
+        # 仓库列和 > 1 → 超领
+        wh_over = np.where(col_sums_wh > 1 + 1e-6)[0]
+        if len(wh_over) > 0:
+            if not force_calculate:
+                bad_nodes = [self.all_nodes[i] for i in wh_over]
+                raise ValueError(
+                    f"以下物料存在超领（领用>可供发出），成本将扭曲：{bad_nodes}\n"
+                    f"可勾选「强制计算」自动处理超领"
+                )
+            else:
+                self._force_normalized = True
+                W_wh_csc = W_warehouse.tocsc()
+                for j in wh_over:
+                    cs = float(col_sums_wh[j])
+                    scale = 1.0 / cs
+                    start = W_wh_csc.indptr[j]
+                    end = W_wh_csc.indptr[j + 1]
+                    W_wh_csc.data[start:end] *= scale
+                    self._force_normalization_log.append({
+                        'node': self.all_nodes[j],
+                        'col_sum': cs,
+                        'correction_factor': cs,
+                    })
+                W_warehouse = W_wh_csc.tocsr()
+                self.W_warehouse = W_warehouse
+                self.W_matrix = W_warehouse
+
+        # 保险2：对角线校验（两个矩阵都查）
+        for w_mat, w_name in [(W_workshop, '车间'), (W_warehouse, '仓库')]:
+            diag = w_mat.diagonal()
+            if np.any(np.abs(diag) > 1e-6):
+                bad_nodes = [self.all_nodes[i] for i in np.where(np.abs(diag) > 1e-6)[0]]
+                raise ValueError(f"{w_name}W矩阵存在自环，节点：{bad_nodes}")
+
+        self.performance_log['构建矩阵'] = time.time() - t0
+
+        # 保存可供发出数量（兼容旧接口）
+        self.available_qty = {}
+        for mat in self.material_nodes:
+            self.available_qty[mat] = workshop_avail[mat] + warehouse_avail[mat]
         self.sales_available_qty = sales_available_qty
-        
-        # Step 4: 构建阀门矩阵D
+
+        # ============================================================
+        # Step 4: 构建阀门矩阵D（车间/仓库共用）
+        # ============================================================
         D_mat = np.ones(n)
-        D_loh = np.ones(n)
-        
+
         order_production = self.io_df.groupby('工单号').agg({
             '产品完工数量': 'sum',
             '在产品数量': 'sum'
         }).reset_index()
-        
+
         for _, row in order_production.iterrows():
             order = str(row['工单号'])
             if order not in self.node_index:
                 continue
-            
             finished = row['产品完工数量']
             wip = row['在产品数量']
             total = finished + wip
-            
             if total > 0:
                 D_mat[self.node_index[order]] = finished / total
             else:
                 D_mat[self.node_index[order]] = 1.0
-        
+
         for mat in self.material_nodes:
             D_mat[self.node_index[mat]] = 1.0
-            D_loh[self.node_index[mat]] = 1.0
-        
+
         # 保险3：D矩阵范围校验
         if np.any(D_mat < 0) or np.any(D_mat > 1):
             raise ValueError("D矩阵（完工率/转出率）存在非法值，必须在[0,1]之间")
-        
-        # 保存D矩阵供成本还原使用
+
         self.D_matrix = D_mat
-        
-        # Step 5: 构建F矩阵（外部投入）
+
+        # ============================================================
+        # Step 5: 构建双F矩阵（车间F_w + 仓库F_h）
+        #   F_w: Col0=车间期初材料, Col1=人工(工单), Col2=制费(工单)
+        #   F_h: Col0=仓库期初材料+采购金额, Col1/2=0
+        # ============================================================
         t0 = time.time()
-        F = np.zeros((n, 3))
-        
-        for _, row in self.initial_df.iterrows():
-            mat = str(row['物料编码'])
-            if mat in self.node_index:
-                F[self.node_index[mat], 0] += row.get('期初材料', 0)
-                F[self.node_index[mat], 1] += row.get('期初人工', 0)
-                F[self.node_index[mat], 2] += row.get('期初制费', 0)
-        
-        for _, row in self.purchase_df.iterrows():
-            mat = str(row['物料编码'])
-            if mat in self.node_index:
-                F[self.node_index[mat], 0] += row['采购金额']
-        
+
+        F_w = np.zeros((n, 3))
+        F_h = np.zeros((n, 3))
+
+        # F_w: 车间期初材料金额 → 物料节点 Col0
+        for mat in self.material_nodes:
+            F_w[self.node_index[mat], 0] = workshop_init_mat[mat]
+
+        # F_w: 人工、制费 → 工单节点 Col1, Col2
         for _, row in self.labor_df.iterrows():
             order = str(row['工单号'])
             if order in self.node_index:
-                F[self.node_index[order], 1] = row['人工']
-                F[self.node_index[order], 2] = row['制费']
-        
-        self.F_matrix = F  # 保存原始F矩阵供成本还原使用
+                idx = self.node_index[order]
+                F_w[idx, 1] += row['人工']
+                F_w[idx, 2] += row['制费']
+
+        # F_h: 仓库期初材料金额 + 采购金额 → 物料节点 Col0
+        for mat in self.material_nodes:
+            F_h[self.node_index[mat], 0] = warehouse_init_mat[mat] + pur_amt[mat]
+
+        self.F_workshop = F_w
+        self.F_warehouse = F_h
+        self.F_matrix = F_w + F_h  # 兼容旧接口
         self.performance_log['构建F矩阵'] = time.time() - t0
-        
-        # Step 6: 求解总成本 X = (I-WD)^(-1) * F
+
+        # ============================================================
+        # Step 6: 双系统分别求解 X = X_w + X_h
+        #   X_w = (I - W_w*D)^(-1) * F_w[:,0]  +  (I - W_w)^(-1) * F_w[:,1:3]
+        #   X_h = (I - W_h*D)^(-1) * F_h[:,0]   (Col1,2全为零)
+        # ============================================================
         t0 = time.time()
-        I = sparse.eye(n)
-        
-        # D矩阵列缩放：W_mat[:,j] = W[:,j] * D_mat[j]
-        W_mat_data = W.data.copy() * D_mat[W.indices]
-        W_mat = sparse.csr_matrix((W_mat_data, W.indices.copy(), W.indptr.copy()), shape=(n, n))
-        A_mat = I - W_mat
-        A_loh = I - W
-        
+        I_sp = sparse.eye(n)
+
+        # 车间 A 矩阵
+        W_ws_mat_data = W_workshop.data.copy() * D_mat[W_workshop.indices]
+        W_ws_mat = sparse.csr_matrix((W_ws_mat_data, W_workshop.indices.copy(), W_workshop.indptr.copy()), shape=(n, n))
+        A_ws_mat = I_sp - W_ws_mat     # 材料列
+        A_ws_loh = I_sp - W_workshop   # 工费列（不用D）
+
+        # 仓库 A 矩阵（仅材料列）
+        W_wh_mat_data = W_warehouse.data.copy() * D_mat[W_warehouse.indices]
+        W_wh_mat = sparse.csr_matrix((W_wh_mat_data, W_warehouse.indices.copy(), W_warehouse.indptr.copy()), shape=(n, n))
+        A_wh_mat = I_sp - W_wh_mat
+
+        # 强制计算正则化（微量扰动防奇异）
+        if force_calculate and self._force_normalized:
+            reg = sparse.eye(n) * 1e-10
+            A_ws_mat = A_ws_mat + reg
+            A_ws_loh = A_ws_loh + reg
+            A_wh_mat = A_wh_mat + reg
+
         try:
-            # spsolve返回1D数组，需reshape
-            X_mat = spsolve(A_mat, F[:, 0]).reshape(-1, 1)
-            X_loh = spsolve(A_loh, F[:, 1:3])
+            # 车间解
+            X_ws_mat = spsolve(A_ws_mat, F_w[:, 0]).reshape(-1, 1)
+            X_ws_loh = spsolve(A_ws_loh, F_w[:, 1:3])
+            X_w = np.hstack([X_ws_mat, X_ws_loh])
+
+            # 仓库解（仅 Col0，Col1/2 全为零向量）
+            X_h_mat = spsolve(A_wh_mat, F_h[:, 0]).reshape(-1, 1)
+            X_h = np.zeros((n, 3))
+            X_h[:, 0:1] = X_h_mat
+
+            X = X_w + X_h
         except Exception:
-            # Fallback：万一稀疏求解崩了，回退到稠密
-            X_mat = np.linalg.solve(A_mat.toarray(), F[:, 0:1])
-            X_loh = np.linalg.solve(A_loh.toarray(), F[:, 1:3])
-        
-        X = np.hstack([X_mat, X_loh])
+            # Fallback：稀疏求解失败回退到稠密
+            X_ws_mat = np.linalg.solve(A_ws_mat.toarray(), F_w[:, 0:1])
+            X_ws_loh = np.linalg.solve(A_ws_loh.toarray(), F_w[:, 1:3])
+            X_w = np.hstack([X_ws_mat, X_ws_loh])
+            X_h_mat = np.linalg.solve(A_wh_mat.toarray(), F_h[:, 0:1])
+            X_h = np.zeros((n, 3))
+            X_h[:, 0:1] = X_h_mat
+            X = X_w + X_h
+
         X = np.round(X, 4)
         self.X_total = X
-        
+        self.X_workshop = np.round(X_w, 4)
+        self.X_warehouse = np.round(X_h, 4)
+
         self.performance_log['矩阵求解'] = time.time() - t0
         self.performance_log['矩阵维度'] = n
         
@@ -733,20 +914,33 @@ class CostCalculator:
                 super_F = np.zeros((n, n_dims))
                 for d_idx, node_idx, val in dim_entries:
                     super_F[node_idx, d_idx] = val
-                
+
+                # 重建 A 矩阵（基于仓库W矩阵，超级还原使用主流转矩阵）
+                W_super = self.W_warehouse
+                W_super_data = W_super.data.copy() * D_mat[W_super.indices]
+                W_super_mat = sparse.csr_matrix(
+                    (W_super_data, W_super.indices.copy(), W_super.indptr.copy()), shape=(n, n))
+                A_super_mat = I_sp - W_super_mat
+                A_super_loh = I_sp - W_super
+                # 强制计算正则化
+                if force_calculate and self._force_normalized:
+                    reg = sparse.eye(n) * 1e-10
+                    A_super_mat = A_super_mat + reg
+                    A_super_loh = A_super_loh + reg
+
                 # 批量求解
                 super_X = np.zeros((n, n_dims))
                 if len(mat_dim_indices) > 0:
                     try:
-                        super_X[:, mat_dim_indices] = spsolve(A_mat, super_F[:, mat_dim_indices])
+                        super_X[:, mat_dim_indices] = spsolve(A_super_mat, super_F[:, mat_dim_indices])
                     except Exception:
-                        super_X[:, mat_dim_indices] = np.linalg.solve(A_mat.toarray(), super_F[:, mat_dim_indices])
-                
+                        super_X[:, mat_dim_indices] = np.linalg.solve(A_super_mat.toarray(), super_F[:, mat_dim_indices])
+
                 if len(loh_dim_indices) > 0:
                     try:
-                        super_X[:, loh_dim_indices] = spsolve(A_loh, super_F[:, loh_dim_indices])
+                        super_X[:, loh_dim_indices] = spsolve(A_super_loh, super_F[:, loh_dim_indices])
                     except Exception:
-                        super_X[:, loh_dim_indices] = np.linalg.solve(A_loh.toarray(), super_F[:, loh_dim_indices])
+                        super_X[:, loh_dim_indices] = np.linalg.solve(A_super_loh.toarray(), super_F[:, loh_dim_indices])
                 
                 super_X = np.round(super_X, 4)
                 
@@ -893,68 +1087,107 @@ class CostCalculator:
                     '超级还原_验证差异': pd.DataFrame(),
                 }
         
-        # Step 7: 计算WIP成本（公式：W × (1-D) × X_mat）
-        # 注意：只用材料列 X_mat，工费不计算WIP
+        # Step 7: 计算WIP成本（双矩阵：车间+仓库分别计算再相加）
+        # 公式：WIP = W_w × (X_w[:,0] × (1-D)) + W_h × (X_h[:,0] × (1-D))
         t0 = time.time()
         I_minus_D = 1 - D_mat
-        wip_at_order_mat = X_mat[:, 0] * I_minus_D  # (1-D) × X_mat
-        
-        # WIP_full = W × wip_at_order_mat，但结果是n×1
-        WIP_mat_col = W.dot(wip_at_order_mat)
-        
+
+        # 车间WIP
+        wip_ws_at_order = self.X_workshop[:, 0] * I_minus_D
+        WIP_ws_col = W_workshop.dot(wip_ws_at_order)
+
+        # 仓库WIP
+        wip_wh_at_order = self.X_warehouse[:, 0] * I_minus_D
+        WIP_wh_col = W_warehouse.dot(wip_wh_at_order)
+
         # 构建完整的WIP矩阵（3列：料、工、费，工费为0）
         WIP_full = np.zeros((n, 3))
-        WIP_full[:, 0] = WIP_mat_col  # 只有材料有WIP
+        WIP_full[:, 0] = WIP_ws_col + WIP_wh_col  # 只有材料有WIP
         WIP_full = np.round(WIP_full, 4)
         self.performance_log['在产品计算'] = time.time() - t0
         
         # Step 8: 结果整理
-        # 8.1 收发存汇总表
-        issue_summary = self.io_df.groupby('材料编码')['材料领用数量'].sum().to_dict()
-        
+        # 8.0 先汇总每个产品的完工入库金额（从工单聚合，含料工费）
+        finished_cost_per_mat = {}
+        for mat in self.material_nodes:
+            finished_cost_per_mat[mat] = 0.0
+
+        for _, row in order_prod_finished.iterrows():
+            order = str(row['工单号'])
+            prod = str(row['产品编码'])
+            finished = row['产品完工数量']
+            if order not in self.node_index or prod not in self.node_index:
+                continue
+
+            order_idx = self.node_index[order]
+            prod_idx = self.node_index[prod]
+            total = order_total_finished.get(order, 0)
+
+            # 产出比例
+            if total > 0:
+                w_ratio = finished / total
+            else:
+                n_products = len(order_prod_finished[order_prod_finished['工单号'] == order])
+                w_ratio = 1.0 / n_products if n_products > 0 else 0
+
+            # 完工率
+            finished_ratio = D_mat[order_idx]
+
+            # 工单总成本（含料工费，X_total）
+            order_mat = X[order_idx, 0]
+            order_lab = X[order_idx, 1]
+            order_oh = X[order_idx, 2]
+
+            # 分配给该产品的完工成本（料按完工率、工费全额）
+            finished_cost_per_mat[prod] += (
+                w_ratio * order_mat * finished_ratio +
+                w_ratio * order_lab +
+                w_ratio * order_oh
+            )
+
+        # 8.1 收发存汇总表（纯会计逻辑：收入=采购金额+完工入库金额）
         # 按物料汇总销售数量（如果有销售数据）
         sales_summary = {}
         if not self.sales_df.empty:
             sales_summary = self.sales_df.groupby('物料编码')['销售数量'].sum().to_dict()
-        
+
         result_list = []
         for mat in self.material_nodes:
-            idx = self.node_index[mat]
-            
-            # 总成本（从X矩阵直接取）
-            total_mat = X[idx, 0]
-            total_lab = X[idx, 1] 
-            total_oh = X[idx, 2]
-            total_cost = total_mat + total_lab + total_oh
-            
-            # WIP（在产品）
-            wip_mat = WIP_full[idx, 0]
-            wip_total = wip_mat
-            
-            # 完工产品成本
-            finished_cost = total_cost - wip_total
-            
-            # 基础数量
-            init_q = init_qty[mat]
-            init_a = init_amt_mat[mat] + init_amt_lab[mat] + init_amt_oh[mat]
+            # 期初（仓库口径，不含车间）
+            init_q = warehouse_init_qty[mat]
+            init_a = warehouse_init_mat[mat]
+
+            # 采购
             pur_q = pur_qty[mat]
-            fin_q = finished_qty_for_report[mat]  # 报表用入库明细的完工数量
-            
-            # 收入数量 = 采购 + 完工
+            pur_a = pur_amt[mat]
+
+            # 完工入库
+            fin_q = finished_qty_for_report[mat]
+            fin_a = finished_cost_per_mat.get(mat, 0)
+
+            # 收入 = 采购 + 完工入库
             receipt_qty = pur_q + fin_q
-            
-            # 收入金额 = 完工产品成本 - 期初金额（剔除以前期间的成本）
-            receipt_amt = finished_cost - init_a
-            
-            # 发出数量 = 生产领用 + 销售出库
-            issue_q = issue_summary.get(mat, 0) + sales_summary.get(mat, 0)
-            
-            # 总数量 = 期初 + 收入
+            receipt_amt = pur_a + fin_a
+
+            # 发出 = 仓库被领用 + 销售出库
+            issue_q = self._warehouse_consumed.get(mat, 0) + sales_summary.get(mat, 0)
+
+            # 月末一次加权平均
+            total_cost = init_a + receipt_amt
             total_q = init_q + receipt_qty
-            
             unit_price = total_cost / total_q if total_q > 0 else 0
+
+            # 强制计算：对超领物料矫正发出单价
+            if force_calculate and self._force_normalized:
+                for entry in self._force_normalization_log:
+                    if entry['node'] == mat:
+                        cf = entry['correction_factor']
+                        if cf > 0:
+                            unit_price = unit_price / cf
+                        break
+
             issue_amt = issue_q * unit_price
-            
+
             result_list.append({
                 '物料编码': mat,
                 '期初数量': round(init_q, 4),
@@ -963,7 +1196,7 @@ class CostCalculator:
                 '本期完工数量': round(fin_q, 4),
                 '本期收入数量': round(receipt_qty, 4),
                 '本期收入金额': round(receipt_amt, 4),
-                '本月领用数量': round(issue_summary.get(mat, 0), 4),
+                '本月领用数量': round(self._warehouse_consumed.get(mat, 0), 4),
                 '本月销售数量': round(sales_summary.get(mat, 0), 4),
                 '本月发出数量': round(issue_q, 4),
                 '发出单价': round(unit_price, 4),
@@ -993,7 +1226,7 @@ class CostCalculator:
             prod_idx = self.node_index[product]
             
             # 获取 W 矩阵产出比例（该工单对产品产出的贡献比例）
-            w_ratio = W[prod_idx, order_idx]
+            w_ratio = W_warehouse[prod_idx, order_idx]
             
             # 完工率（来自 D 矩阵，只用于成本分配！）
             finished_ratio = D_mat[order_idx]
@@ -1073,7 +1306,7 @@ class CostCalculator:
             
             order_idx = self.node_index[order]
             prod_idx = self.node_index[product]
-            w_ratio = W[prod_idx, order_idx]
+            w_ratio = W_warehouse[prod_idx, order_idx]
             finished_ratio = D_mat[order_idx]
             
             order_total_mat = X[order_idx, 0]
@@ -1111,8 +1344,8 @@ class CostCalculator:
             mat_idx = self.node_index[material]
             
             # W矩阵比例（用于展示）
-            w_mat_to_order = W[order_idx, mat_idx]
-            w_order_to_prod = W[prod_idx, order_idx]
+            w_mat_to_order = W_warehouse[order_idx, mat_idx]
+            w_order_to_prod = W_warehouse[prod_idx, order_idx]
             finished_ratio = D_mat[order_idx]
             
             # 获取该工单-产品的汇总数据
@@ -1186,24 +1419,28 @@ class CostCalculator:
         if calculate_step_method:
             t0 = time.time()
             
-            # S_人工 = (I + W × D) × F_工
-            # S_制费 = (I + W × D) × F_制费
-            I_plus_WD = I + W_mat  # I + W × D_mat
-            
-            S_lab = I_plus_WD.dot(F[:, 1])  # 人工列
-            S_oh = I_plus_WD.dot(F[:, 2])   # 制费列
-            
+            # S_人工 = (I + W_h × D) × F_工
+            # S_制费 = (I + W_h × D) × F_制费
+            W_step_data = W_warehouse.data.copy() * D_mat[W_warehouse.indices]
+            W_step_mat = sparse.csr_matrix(
+                (W_step_data, W_warehouse.indices.copy(), W_warehouse.indptr.copy()), shape=(n, n))
+            I_plus_WD = I_sp + W_step_mat  # I + W_h × D_mat
+            F_combined = self.F_matrix
+
+            S_lab = I_plus_WD.dot(F_combined[:, 1])  # 人工列
+            S_oh = I_plus_WD.dot(F_combined[:, 2])   # 制费列
+
             # S_材料 = X_combine总 - S_人工 - S_制费
             X_combine_total = X.sum(axis=1)  # 每行的料+工+费总和
             S_mat = X_combine_total - S_lab - S_oh
-            
+
             # 构建 S 矩阵 (n × 3)
             S = np.column_stack([S_mat, S_lab, S_oh])
             S = np.round(S, 4)
-            
-            # 逐步结转法下的 WIP = W × (I-D) × S_材料
+
+            # 逐步结转法下的 WIP = W_h × (I-D) × S_材料
             wip_step_at_order = S_mat * I_minus_D  # (1-D) × S_材料
-            WIP_step_col = W.dot(wip_step_at_order)
+            WIP_step_col = W_warehouse.dot(wip_step_at_order)
             WIP_step = np.zeros((n, 3))
             WIP_step[:, 0] = WIP_step_col
             WIP_step = np.round(WIP_step, 4)
@@ -1220,7 +1457,7 @@ class CostCalculator:
                 order_idx = self.node_index[order]
                 prod_idx = self.node_index[product]
                 
-                w_ratio = W[prod_idx, order_idx]
+                w_ratio = W_warehouse[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 finished_q = row['产品完工数量']
@@ -1277,7 +1514,7 @@ class CostCalculator:
                 
                 order_idx = self.node_index[order]
                 prod_idx = self.node_index[product]
-                w_ratio = W[prod_idx, order_idx]
+                w_ratio = W_warehouse[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 # 逐步结转法使用S矩阵
@@ -1314,8 +1551,8 @@ class CostCalculator:
                 mat_idx = self.node_index[material]
                 
                 # W矩阵比例（用于展示）
-                w_mat_to_order = W[order_idx, mat_idx]
-                w_order_to_prod = W[prod_idx, order_idx]
+                w_mat_to_order = W_warehouse[order_idx, mat_idx]
+                w_order_to_prod = W_warehouse[prod_idx, order_idx]
                 finished_ratio = D_mat[order_idx]
                 
                 # 获取该工单-产品的汇总数据
@@ -1679,7 +1916,8 @@ class CostCalculator:
 
 
 def calculate_period(data_dict, finished_df=None, finished_map=None,
-                     calculate_step_method=False, calculate_super_restoration=False):
+                     calculate_step_method=False, calculate_super_restoration=False,
+                     force_calculate=False):
     """对单月份数据执行成本核算"""
     calc = CostCalculator()
     calc.load_data(data_dict)
@@ -1689,9 +1927,163 @@ def calculate_period(data_dict, finished_df=None, finished_map=None,
         finished_df=finished_df,
         finished_map=finished_map,
         calculate_step_method=calculate_step_method,
-        calculate_super_restoration=calculate_super_restoration
+        calculate_super_restoration=calculate_super_restoration,
+        force_calculate=force_calculate
     )
     return result, calc
+
+
+def write_debug_log(calc, filepath):
+    """输出双矩阵调试日志到文件。
+
+    Parameters
+    ----------
+    calc : CostCalculator
+        已执行 calculate() 的实例
+    filepath : str
+        日志文件路径
+    """
+    with open(filepath, 'w', encoding='utf-8') as f:
+        sep = "=" * 60
+        f.write(f"{sep}\n")
+        f.write("  成本核算调试日志（双矩阵版）\n")
+        f.write(f"{sep}\n\n")
+
+        # ---- S1: 节点统计 ----
+        mn = len(calc.material_nodes) if calc.material_nodes else 0
+        on_val = len(calc.order_nodes) if calc.order_nodes else 0
+        f.write(f"【S1】节点统计\n")
+        f.write(f"  物料节点: {mn}\n")
+        f.write(f"  工单节点: {on_val}\n")
+        f.write(f"  总节点: {mn + on_val}\n\n")
+
+        # ---- S2: 可供发出数量 ----
+        f.write(f"【S2】可供发出数量\n")
+        if calc.available_qty:
+            qtys = np.array(list(calc.available_qty.values()))
+            f.write(f"  总计: min={float(qtys.min()):.2f}, max={float(qtys.max()):.2f}, "
+                    f"mean={float(qtys.mean()):.2f}, zero={int((qtys == 0).sum())}\n")
+            top5 = sorted(calc.available_qty.items(), key=lambda x: x[1], reverse=True)[:5]
+            f.write(f"  Top5:\n")
+            for mat, q in top5:
+                f.write(f"    {mat}: {q:.2f}\n")
+        else:
+            f.write("  无数据\n")
+        # 车间/仓库消耗摘要
+        if calc._workshop_consumed:
+            ws_vals = list(calc._workshop_consumed.values())
+            wh_vals = list(calc._warehouse_consumed.values())
+            ws_nonzero = sum(1 for v in ws_vals if v > 0)
+            wh_nonzero = sum(1 for v in wh_vals if v > 0)
+            f.write(f"  车间消耗: {ws_nonzero}物料非零, 总计{sum(ws_vals):.2f}\n")
+            f.write(f"  仓库消耗: {wh_nonzero}物料非零, 总计{sum(wh_vals):.2f}\n")
+        f.write("\n")
+
+        # ---- S3: W矩阵统计 ----
+        f.write(f"【S3】W矩阵\n")
+        for w_mat, w_name in [(calc.W_workshop, '车间'), (calc.W_warehouse, '仓库')]:
+            if w_mat is not None:
+                nnz = w_mat.nnz
+                sparsity = nnz / (mn + on_val) ** 2 * 100 if (mn + on_val) > 0 else 0
+                col_sums = np.array(w_mat.sum(axis=0)).flatten()
+                over_one = int((col_sums > 1 + 1e-6).sum())
+                diag = w_mat.diagonal()
+                loop_idx = np.where(np.abs(diag) > 1e-6)[0]
+                f.write(f"  [{w_name}] nnz={nnz}, 稀疏度={sparsity:.4f}%\n")
+                f.write(f"    列和: min={float(col_sums.min()):.6f}, max={float(col_sums.max()):.6f}, "
+                        f"mean={float(col_sums.mean()):.6f}, >1={over_one}\n")
+                if len(loop_idx) > 0:
+                    nodes = [calc.all_nodes[i] for i in loop_idx] if calc.all_nodes else []
+                    f.write(f"    [WARN] 自环节点: {nodes}\n")
+                else:
+                    f.write(f"    自环节点: 0\n")
+            else:
+                f.write(f"  [{w_name}] 无数据\n")
+        f.write("\n")
+
+        # ---- S4: D矩阵 ----
+        f.write(f"【S4】D矩阵\n")
+        if calc.D_matrix is not None and calc.material_nodes and calc.node_index:
+            D = calc.D_matrix
+            mat_idx_list = [calc.node_index[m] for m in calc.material_nodes if m in calc.node_index]
+            d1_count = sum(1 for i in mat_idx_list if abs(D[i] - 1.0) < 1e-10)
+            f.write(f"  物料D=1: {d1_count}/{len(mat_idx_list)}\n")
+            ord_idx_list = [calc.node_index[o] for o in calc.order_nodes if o in calc.node_index]
+            if ord_idx_list:
+                d_vals = [D[i] for i in ord_idx_list]
+                f.write(f"  工单D: min={min(d_vals):.4f}, max={max(d_vals):.4f}, "
+                        f"<1的数量={sum(1 for d in d_vals if d < 1.0)}\n")
+        else:
+            f.write("  无数据\n")
+        f.write("\n")
+
+        # ---- S5: F矩阵 ----
+        f.write(f"【S5】F矩阵\n")
+        for f_mat, f_name in [(calc.F_workshop, '车间'), (calc.F_warehouse, '仓库')]:
+            if f_mat is not None:
+                for ci, cn in enumerate(['材料', '人工', '制费']):
+                    col = f_mat[:, ci]
+                    f.write(f"  [{f_name}] {cn}: sum={float(col.sum()):.2f}, "
+                            f"non-zero={int(np.count_nonzero(col))}\n")
+            else:
+                f.write(f"  [{f_name}] 无数据\n")
+        f.write("\n")
+
+        # ---- S6: X矩阵 ----
+        f.write(f"【S6】X矩阵求解结果\n")
+        if calc.X_total is not None:
+            X = calc.X_total
+            for ci, cn in enumerate(['材料', '人工', '制费']):
+                col = X[:, ci]
+                f.write(f"  {cn}: min={float(col.min()):.4f}, max={float(col.max()):.4f}, "
+                        f"sum={float(col.sum()):.2f}, NaN={int(np.isnan(col).sum())}, "
+                        f"Inf={int(np.isinf(col).sum())}, 全零行={int((col == 0).sum())}\n")
+            # 车间/仓库分别统计
+            if hasattr(calc, 'X_workshop') and calc.X_workshop is not None:
+                Xw = calc.X_workshop
+                f.write(f"  其中车间X: 料sum={float(Xw[:,0].sum()):.2f}, "
+                        f"工sum={float(Xw[:,1].sum()):.2f}, 费sum={float(Xw[:,2].sum()):.2f}\n")
+            if hasattr(calc, 'X_warehouse') and calc.X_warehouse is not None:
+                Xh = calc.X_warehouse
+                f.write(f"  其中仓库X: 料sum={float(Xh[:,0].sum()):.2f}\n")
+        else:
+            f.write("  无数据\n")
+        f.write("\n")
+
+        # ---- S7: 收发存摘要 ----
+        f.write(f"【S7】收发存汇总\n")
+        if calc.result and '收发存' in calc.result and not calc.result['收发存'].empty:
+            df = calc.result['收发存']
+            for col in ['期初数量', '本期收入数量', '本月发出数量', '期末数量', '期末金额']:
+                if col in df.columns:
+                    f.write(f"  {col}: min={float(df[col].min()):.2f}, "
+                            f"max={float(df[col].max()):.2f}, sum={float(df[col].sum()):.2f}\n")
+        else:
+            f.write("  无数据\n")
+        f.write("\n")
+
+        # ---- 自环跳过记录 ----
+        if calc._self_loop_skipped:
+            f.write(f"【自环跳过】{len(calc._self_loop_skipped)}条\n")
+            for entry in calc._self_loop_skipped[:10]:
+                f.write(f"  工单={entry['order']}, 物料={entry['material']}, "
+                        f"产品={entry['product']}, 领用={entry['issue_qty']}\n")
+            if len(calc._self_loop_skipped) > 10:
+                f.write(f"  ... 共{len(calc._self_loop_skipped)}条\n")
+            f.write("\n")
+
+        # ---- 强制计算记录 ----
+        if calc._force_normalized and calc._force_normalization_log:
+            f.write(f"【强制计算】{len(calc._force_normalization_log)}个物料被归一化\n")
+            for entry in calc._force_normalization_log:
+                f.write(f"  物料={entry['node']}, 原始列和={entry['col_sum']:.6f}, "
+                        f"矫正系数={entry['correction_factor']:.6f}\n")
+            f.write("\n")
+
+        # ---- 矩阵维度 ----
+        dim = calc.performance_log.get('矩阵维度', 'N/A') if calc.performance_log else 'N/A'
+        f.write(f"矩阵维度: {dim}\n")
+        f.write(f"{sep}\n")
 
 
 def to_excel(df_dict):
