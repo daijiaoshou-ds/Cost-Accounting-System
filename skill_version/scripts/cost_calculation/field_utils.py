@@ -138,6 +138,11 @@ def smart_match(columns, file_type):
 # 边表 & 路径表
 # ============================================================================
 
+def _is_mat(node):
+    """判断节点是否为物料节点（独立节点设计：带 #车间 或 #仓库 后缀）"""
+    return node.endswith('#车间') or node.endswith('#仓库')
+
+
 def create_edge_table(calc):
     """生成边表：W 矩阵中相邻流转关系"""
     try:
@@ -145,8 +150,7 @@ def create_edge_table(calc):
             return None
         W = calc.W_matrix
         all_nodes = calc.all_nodes
-        material_nodes = calc.material_nodes
-        order_nodes = calc.order_nodes
+        order_nodes = set(calc.order_nodes)
         rows = []
         edge_id = 0
         W_coo = W.tocoo()
@@ -156,8 +160,8 @@ def create_edge_table(calc):
                 source = all_nodes[j]
                 target = all_nodes[i]
                 weight = float(w)
-                is_mat2order = (source in material_nodes) and (target in order_nodes)
-                is_order2mat = (source in order_nodes) and (target in material_nodes)
+                is_mat2order = _is_mat(source) and (target in order_nodes)
+                is_order2mat = (source in order_nodes) and _is_mat(target)
                 rows.append({
                     '边ID': f"E{edge_id:03d}",
                     '起点': source,
@@ -179,8 +183,8 @@ def create_path_table(calc):
             return None
         W = calc.W_matrix
         all_nodes = calc.all_nodes
-        material_nodes = calc.material_nodes
-        order_nodes = calc.order_nodes
+        order_nodes = set(calc.order_nodes)
+        mat_nodes_all = [n for n in all_nodes if _is_mat(n)]
 
         out_edges = {node: [] for node in all_nodes}
         in_edges = {node: [] for node in all_nodes}
@@ -196,10 +200,10 @@ def create_path_table(calc):
                 in_edges[target].append(source)
                 edge_weight[(source, target)] = weight
 
-        roots = [node for node in material_nodes if not in_edges[node]]
+        roots = [node for node in mat_nodes_all if not in_edges.get(node)]
         if not roots:
-            roots = list(material_nodes)
-        leaves = [node for node in material_nodes if not out_edges[node]]
+            roots = mat_nodes_all
+        leaves = [node for node in mat_nodes_all if not out_edges.get(node)]
 
         all_paths = []
 
@@ -227,7 +231,7 @@ def create_path_table(calc):
                 row[f'第{i}层'] = path[i - 1] if i <= len(path) else ''
             final_product = None
             for node in reversed(path):
-                if node in material_nodes:
+                if _is_mat(node):
                     final_product = node
                     break
             row['最终成品'] = final_product if final_product else path[-1]

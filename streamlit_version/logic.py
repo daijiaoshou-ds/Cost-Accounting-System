@@ -66,7 +66,8 @@ TABLE_SCHEMA = {
         'required': ['年度', '月份', '存货编码', '出库单号', '销售数量'],
         'rename': {'存货编码': '物料编码', '出库单号': '销售批次号'},
         'groupby': ['年度', '月份', '物料编码', '销售批次号'],
-        'agg': {'销售数量': 'sum'},
+        'agg': {'销售数量': 'sum', '销售金额': 'sum'},
+        'optional': {'销售金额': 0},
     },
 }
 
@@ -310,13 +311,20 @@ class CostCalculator:
         # 销售数据（可选）
         df_sales = data_dict.get('sales', pd.DataFrame())
         if df_sales.empty:
-            self.sales_df = pd.DataFrame(columns=['物料编码', '销售批次号', '销售数量'])
+            self.sales_df = pd.DataFrame(columns=['物料编码', '销售批次号', '销售数量', '销售金额'])
         else:
             df_sales = df_sales.copy()
             df_sales['物料编码'] = df_sales['物料编码'].astype(str).str.strip()
             df_sales['销售数量'] = pd.to_numeric(df_sales['销售数量'], errors='coerce').fillna(0)
             df_sales['销售批次号'] = df_sales['销售批次号'].astype(str).str.strip()
-            self.sales_df = df_sales.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+            if '销售金额' in df_sales.columns:
+                df_sales['销售金额'] = pd.to_numeric(df_sales['销售金额'], errors='coerce').fillna(0)
+            else:
+                df_sales['销售金额'] = 0
+            self.sales_df = df_sales.groupby(['物料编码', '销售批次号']).agg(
+                销售数量=('销售数量', 'sum'),
+                销售金额=('销售金额', 'sum'),
+            ).reset_index()
         
         # 完工入库（可选）
         df_fin = data_dict.get('finished', pd.DataFrame())
@@ -764,9 +772,12 @@ class CostCalculator:
         sales_cost_df = pd.DataFrame()
         if not self.sales_df.empty:
             t0 = time.time()
-            
-            # 按物料汇总销售数量
+
+            # 按物料汇总销售数量和销售金额
             mat_sales = self.sales_df.groupby('物料编码')['销售数量'].sum().to_dict()
+            mat_revenue = {}
+            if '销售金额' in self.sales_df.columns:
+                mat_revenue = self.sales_df.groupby('物料编码')['销售金额'].sum().to_dict()
             batch_sales = self.sales_df  # 已按(物料, 批次)聚合
 
             # 构建 Sale 对角阵（稀疏，基于仓库节点）
@@ -790,6 +801,7 @@ class CostCalculator:
                 mat = str(row['物料编码'])
                 batch = str(row['销售批次号'])
                 qty = row['销售数量']
+                revenue = float(row.get('销售金额', 0) or 0)
                 if mat not in self._mat_wh_idx or batch not in batch_index:
                     continue
                 wh_idx = self._mat_wh_idx[mat]
@@ -802,6 +814,7 @@ class CostCalculator:
                     b_data.append(ratio)
                 batch_sales_info[(batch, mat)] = {
                     'qty': qty,
+                    'revenue': revenue,
                     'avail': self.sales_available_qty.get(mat, 0),
                     'sales_ratio': S_diag[wh_idx],
                     'batch_ratio': ratio if total_sales > 0 else 0,
@@ -826,6 +839,7 @@ class CostCalculator:
                     '销售批次号': batch,
                     '物料编码': mat,
                     '销售数量': round(info['qty'], 2),
+                    '销售金额': round(info['revenue'], 2),
                     '可供发出数量': round(info['avail'], 2),
                     '销售占比': f"{info['sales_ratio']:.2%}",
                     '批次占物料销售比': f"{info['batch_ratio']:.2%}",
@@ -1426,12 +1440,20 @@ class CostCalculator:
         df['物料编码'] = df['物料编码'].astype(str).str.strip()
         df['销售数量'] = pd.to_numeric(df['销售数量'], errors='coerce').fillna(0)
         df['销售批次号'] = df['销售批次号'].astype(str).str.strip()
-        
+        # 销售金额可能不存在（旧格式），安全兜底
+        if '销售金额' in df.columns:
+            df['销售金额'] = pd.to_numeric(df['销售金额'], errors='coerce').fillna(0)
+        else:
+            df['销售金额'] = 0
+
         # 按物料汇总销售数量
         mat_sales = df.groupby('物料编码')['销售数量'].sum().to_dict()
-        
-        # 按(物料, 批次)汇总销售数量
-        batch_sales = df.groupby(['物料编码', '销售批次号'])['销售数量'].sum().reset_index()
+
+        # 按(物料, 批次)汇总销售数量和销售金额
+        batch_sales = df.groupby(['物料编码', '销售批次号']).agg(
+            销售数量=('销售数量', 'sum'),
+            销售金额=('销售金额', 'sum'),
+        ).reset_index()
         
         n = len(self.all_nodes)
         
@@ -1477,33 +1499,31 @@ class CostCalculator:
             mat = str(row['物料编码'])
             batch = str(row['销售批次号'])
             qty = row['销售数量']
-            
+            revenue = float(row.get('销售金额', 0) or 0)
+
             if mat not in self.node_index:
                 continue
-            
+
             mat_idx = self._mat_wh_idx[mat]
             batch_idx = batch_index.get(batch)
             if batch_idx is None:
                 continue
-            
+
             avail = self.available_qty.get(mat, 0)
             total_sales = mat_sales.get(mat, 0)
             sales_ratio = S[mat_idx, mat_idx]  # 销售占比 = 总销售 / 可供发出
             batch_ratio = B[batch_idx, mat_idx]  # 批次占比 = 批次销售 / 总销售
-            
-            # 从 C 矩阵取该批次的成本（如果同一批次有多个物料，需要按物料拆分）
-            # 实际上 C[batch_idx] 是该批次所有物料的成本之和
-            # 所以按 batch_ratio / 该批次在所有物料上的占比 来拆分
-            # 更简单：直接用 batch_ratio * SX[mat_idx]
+
             cost_mat = batch_ratio * SX[mat_idx, 0]
             cost_lab = batch_ratio * SX[mat_idx, 1]
             cost_oh = batch_ratio * SX[mat_idx, 2]
             cost_total = cost_mat + cost_lab + cost_oh
-            
+
             result_list.append({
                 '销售批次号': batch,
                 '物料编码': mat,
                 '销售数量': round(qty, 2),
+                '销售金额': round(revenue, 2),
                 '可供发出数量': round(avail, 2),
                 '销售占比': f"{sales_ratio:.2%}",
                 '批次占物料销售比': f"{batch_ratio:.2%}",

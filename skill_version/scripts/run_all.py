@@ -14,6 +14,7 @@ import json
 import sys
 import time
 import os
+import webbrowser
 from pathlib import Path
 from datetime import datetime
 
@@ -48,6 +49,8 @@ def main():
                         help="跳过环境检查")
     parser.add_argument("--top", type=int, default=20,
                         help="成本波动 Top N 产品数")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="强制计算（超领时自动归一化而非报错）")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -81,7 +84,10 @@ def main():
     t0 = time.time()
     try:
         from scripts.cost_calculation.pipeline_cli import run_from_config
-        ctx, index_path = run_from_config(str(config_path.resolve()), str(output_dir.resolve()))
+        ctx, index_path = run_from_config(
+            str(config_path.resolve()), str(output_dir.resolve()),
+            force_calculate_override=args.force if args.force else None
+        )
         if ctx.log.has_errors or index_path is None:
             run_summary["steps"]["core_calculation"] = step_result(
                 "error", errors=ctx.log.errors
@@ -100,11 +106,23 @@ def main():
         from scripts.cost_fluctuation.main import analyze as analyze_fluctuation
         fluct_result = analyze_fluctuation(str(output_dir.resolve()), top_n=args.top)
         status = fluct_result.get("summary", {}).get("status", "error")
-        fluct_path = output_dir / "cost_fluctuation.json"
+        if status == "completed":
+            summary = fluct_result["summary"]
+            # 清理内部字段
+            for item in summary.get('fluctuation_ranking', []):
+                item.pop('_max_change_signed', None)
+            fluct_json_path = output_dir / "cost_fluctuation.json"
+            fluct_csv_path = output_dir / "cost_fluctuation.csv"
+            # 包裹 summary + detail，兼容 HTML 模板的 .summary 访问
+            wrapper = {"summary": summary, "detail": fluct_result.get("detail", [])}
+            fluct_json_path.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2), encoding='utf-8')
+            fluct_result["dataframe"].to_csv(fluct_csv_path, index=False, encoding='utf-8-sig')
+        else:
+            fluct_json_path = output_dir / "cost_fluctuation.json"
         run_summary["steps"]["cost_fluctuation"] = step_result(
             "ok" if status == "completed" else "warning",
             products=fluct_result.get("summary", {}).get("total_products", 0),
-            json=str(fluct_path.resolve()) if fluct_path.exists() else None,
+            json=str(fluct_json_path.resolve()) if fluct_json_path.exists() else None,
         )
     except Exception as e:
         run_summary["steps"]["cost_fluctuation"] = step_result("error", error=str(e))
@@ -116,11 +134,21 @@ def main():
         from scripts.margin_analysis.main import analyze_margin
         margin_result = analyze_margin(str(output_dir.resolve()))
         status = margin_result.get("summary", {}).get("status", "error")
-        margin_path = output_dir / "margin_analysis.json"
+        if status == "completed":
+            margin_json_path = output_dir / "margin_analysis.json"
+            margin_csv_path = output_dir / "margin_analysis.csv"
+            # 包裹 summary + records_count，兼容 HTML 模板的 .summary 访问
+            wrapper = {"summary": margin_result["summary"], "records_count": len(margin_result.get("records", []))}
+            margin_json_path.write_text(
+                json.dumps(wrapper, ensure_ascii=False, indent=2),
+                encoding='utf-8')
+            margin_result["dataframe"].to_csv(margin_csv_path, index=False, encoding='utf-8-sig')
+        else:
+            margin_json_path = output_dir / "margin_analysis.json"
         run_summary["steps"]["margin_analysis"] = step_result(
             "ok" if status == "completed" else "warning",
             batches=margin_result.get("summary", {}).get("total_batches", 0),
-            json=str(margin_path.resolve()) if margin_path.exists() else None,
+            json=str(margin_json_path.resolve()) if margin_json_path.exists() else None,
         )
     except Exception as e:
         run_summary["steps"]["margin_analysis"] = step_result("error", error=str(e))
@@ -133,6 +161,11 @@ def main():
         html_path = gen_html(str(output_dir.resolve()))
         if html_path:
             run_summary["steps"]["html_report"] = step_result("ok", html=html_path)
+            # 自动在默认浏览器打开报告
+            try:
+                webbrowser.open(f"file:///{html_path}")
+            except Exception:
+                pass
         else:
             run_summary["steps"]["html_report"] = step_result(
                 "skipped", reason="missing analysis JSON files"

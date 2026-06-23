@@ -10,8 +10,7 @@
   },
   "mapping_overrides": {},
   "options": {
-    "calculate_step_method": false,
-    "calculate_super_restoration": true
+    "calculate_step_method": false
   },
   "output_dir": "./output"
 }

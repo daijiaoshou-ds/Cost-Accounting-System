@@ -81,8 +81,8 @@ def build_parser():
     opt = p.add_argument_group("计算选项")
     opt.add_argument("--step-method", action="store_true", default=False,
                      help="启用逐步结转法")
-    opt.add_argument("--super-restore", action="store_true", default=False,
-                     help="启用超级成本还原")
+    opt.add_argument("--force", action="store_true", default=False,
+                     help="强制计算（超领时自动归一化而非报错）")
 
     # --- 输出 ---
     out = p.add_argument_group("输出")
@@ -118,7 +118,7 @@ def build_config_from_args(args) -> dict:
         "mapping_overrides": {},
         "options": {
             "calculate_step_method": args.step_method,
-            "calculate_super_restoration": args.super_restore,
+            "force_calculate": args.force,
         },
         "output_dir": args.output_dir,
     }
@@ -212,8 +212,7 @@ def write_results(ctx, output_dir: str):
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
 
-    # ---- 流水线日志 (txt 给人看, json 给 AI 读) ----
-    (root / "_pipeline_log.txt").write_text(ctx.log.summary(), encoding='utf-8')
+    # ---- 流水线日志 (统一 JSON 格式) ----
     log_dict = ctx.log.to_dict()
     log_dict["metadata"] = {"pipeline_version": "3.5", "status": "completed" if not ctx.log.has_errors else "error"}
     log_dict["validation"] = getattr(ctx, 'validation', {})
@@ -372,9 +371,20 @@ def print_summary(ctx, output_dir: str = "./output"):
 # 可导入的入口函数 (供 run_all.py 调用)
 # ============================================================================
 
-def run_from_config(config_path: str, output_dir: str):
+def run_from_config(config_path: str, output_dir: str,
+                    force_calculate_override: bool = None):
     """
     从配置文件执行完整核算流水线。
+
+    Parameters:
+    -----------
+    config_path : str
+        JSON 配置文件路径
+    output_dir : str
+        结果输出目录
+    force_calculate_override : bool, optional
+        覆盖配置文件中的 force_calculate 设置。用于 CLI --force 参数。
+
     返回: (PipelineContext, index_json_path)
     """
     config = load_config_from_json(config_path)
@@ -390,11 +400,15 @@ def run_from_config(config_path: str, output_dir: str):
 
     mapping_dict = build_mappings(config, file_dict)
 
+    # CLI --force 覆盖配置文件设置
+    force_calc = force_calculate_override if force_calculate_override is not None \
+        else options.get('force_calculate', True)
+
     pipeline = CostPipeline()
     ctx = pipeline.run(
         file_dict, mapping_dict,
         calculate_step_method=options.get('calculate_step_method', False),
-        calculate_super_restoration=options.get('calculate_super_restoration', True),
+        force_calculate=force_calc,
         stop_on_error=True,
     )
 
@@ -431,7 +445,7 @@ def main():
             config["output_dir"] = args.output_dir
         config.setdefault("options", {})
         config["options"].setdefault("calculate_step_method", args.step_method)
-        config["options"].setdefault("calculate_super_restoration", args.super_restore)
+        config["options"].setdefault("force_calculate", args.force)
     else:
         config = build_config_from_args(args)
 
@@ -512,8 +526,7 @@ def main():
         ctx = pipeline.run(
             file_dict, mapping_dict,
             calculate_step_method=options.get('calculate_step_method', False),
-            calculate_super_restoration=options.get('calculate_super_restoration', False),
-            log_dir=os.path.join(output_dir, 'log'),
+            force_calculate=options.get('force_calculate', True),
             stop_on_error=True,
         )
     except Exception as e:

@@ -162,7 +162,7 @@ class CostPipeline:
         pipeline = CostPipeline()
         ctx = pipeline.run(file_dict, mapping_dict,
                            calculate_step_method=True,
-                           calculate_super_restoration=False)
+                           force_calculate=True)
         # 访问结果: ctx.monthly_results[(2026, 1)]
         # 查看日志: ctx.log.summary()
     """
@@ -259,15 +259,14 @@ class CostPipeline:
     # ================================================================
     # S3: 矩阵校验与日志
     # ================================================================
-    def stage3_matrix_validate(self, ctx: PipelineContext,
-                                log_dir: str = None) -> PipelineContext:
+    def stage3_matrix_validate(self, ctx: PipelineContext) -> PipelineContext:
         """
         S3 — 矩阵校验与日志排查
         ├── 取第一个月份构建 W/D 矩阵做抽样校验
         ├── 保险1: W 列和 ≤ 1（防超领）
         ├── 保险2: DAG 无环（防自循环）
         ├── 保险3: D 矩阵范围 [0, 1]
-        └── 输出校验日志到文件
+        └── 校验结果写入 ctx.validation（最终输出到 _pipeline_log.json）
         """
         t0 = time.time()
 
@@ -281,12 +280,21 @@ class CostPipeline:
         sample_data = ctx.monthly_data[sample_key]
 
         calc = CostCalculator()
+        force_calc = ctx.options.get('force_calculate', True)
         try:
             calc.load_data(sample_data)
-            calc.calculate()  # 触发三道保险
+            calc.calculate(force_calculate=force_calc)  # 触发三道保险
         except ValueError as e:
             error_msg = str(e)
+            hint = ""
+            if '超领' in error_msg or '强制计算' in error_msg:
+                hint = ("检测到物料超领（领用 > 可供发出），成本计算无法继续。"
+                        "请使用 --force 参数重试，系统将自动归一化超领列。"
+                        "CLI: python pipeline_cli.py --config config.json --force\n"
+                        "也可在 config.json 中设置 options.force_calculate = true")
             ctx.log.error(f"矩阵校验失败: {error_msg}")
+            if hint:
+                ctx.log.warn(hint)
             # 失败时也填充结构化 validation，让 AI 可以解读
             n_nodes = len(calc.all_nodes) if hasattr(calc, 'all_nodes') and calc.all_nodes else 0
             ctx.validation = {
@@ -296,6 +304,10 @@ class CostPipeline:
                 "passed": False,
                 "error_type": "ValueError",
                 "error_message": error_msg,
+                "suggested_action": (
+                    "检测到物料超领。建议使用 --force 参数重新运行："
+                    "python pipeline_cli.py --config config.json --force"
+                ) if ('超领' in error_msg or '强制计算' in error_msg) else "检查输入数据",
                 "W_col_sum_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
                 "self_loop_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
                 "D_range_check": {"passed": False, "detail": "矩阵构建阶段失败，参见 error_message"},
@@ -357,6 +369,8 @@ class CostPipeline:
 
         # ---- 结构化 validation 块 (供 AI 读取) ----
         over_one_nodes = [calc.all_nodes[i] for i in over_one] if len(over_one) > 0 else []
+        # 收集强制计算归一化记录（AI 可据此告知用户哪些物料被处理了）
+        force_log = getattr(calc, '_force_normalization_log', [])
         ctx.validation = {
             "sample_month": f"{sample_key[0]}Y{sample_key[1]:02d}M",
             "matrix_dimension": n,
@@ -378,15 +392,10 @@ class CostPipeline:
             },
             "nnz": int(nnz),
             "sparsity_percent": round(sparsity, 4),
+            "force_normalized": bool(force_log),
+            "force_normalized_count": len(force_log),
+            "force_normalized_nodes": [e['node'] for e in force_log[:20]],
         }
-
-        # 输出日志文件（默认跟随输出目录）
-        if log_dir is None:
-            log_dir = os.path.join(os.path.dirname(__file__), '..', 'log')
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f'pipeline_validation_{sample_key[0]}Y{sample_key[1]:02d}M.txt')
-        ctx.log.write_to_file(log_path)
-        ctx.log.metric('stage3_日志文件', log_path)
 
         ctx.validation_passed = not ctx.log.has_errors
         ctx.log.time_stage('S3_矩阵校验与日志', time.time() - t0)
@@ -425,7 +434,7 @@ class CostPipeline:
             try:
                 calc.calculate(
                     calculate_step_method=ctx.options.get('calculate_step_method', False),
-                    calculate_super_restoration=ctx.options.get('calculate_super_restoration', False),
+                    force_calculate=ctx.options.get('force_calculate', False),
                 )
             except Exception as e:
                 ctx.log.error(f"{year}年{month}月 矩阵求解失败: {e}")
@@ -498,8 +507,7 @@ class CostPipeline:
             file_dict: Dict[str, Any],
             mapping_dict: Dict[str, Dict[str, str]],
             calculate_step_method: bool = False,
-            calculate_super_restoration: bool = False,
-            log_dir: str = None,
+            force_calculate: bool = True,
             stop_on_error: bool = True) -> PipelineContext:
         """
         执行完整的 5 阶段 SOP 流水线。
@@ -509,8 +517,8 @@ class CostPipeline:
         file_dict :  {表名: file_like_object}
         mapping_dict : {表名: {原始列名: 标准名}}
         calculate_step_method : 是否计算逐步结转法
-        calculate_super_restoration : 是否计算超级成本还原
-        log_dir : 日志输出目录
+        force_calculate : 是否强制计算（超领时自动归一化），默认开启
+        stop_on_error : S3 校验不通过时是否终止
         stop_on_error : S3 校验不通过时是否终止
 
         Returns:
@@ -524,7 +532,7 @@ class CostPipeline:
             mapping_dict=mapping_dict,
             options={
                 'calculate_step_method': calculate_step_method,
-                'calculate_super_restoration': calculate_super_restoration,
+                'force_calculate': force_calculate,
             }
         )
 
@@ -541,7 +549,7 @@ class CostPipeline:
             return ctx
 
         # ==================== S3 ====================
-        ctx = self.stage3_matrix_validate(ctx, log_dir=log_dir)
+        ctx = self.stage3_matrix_validate(ctx)
         if ctx.log.has_errors and stop_on_error:
             ctx.log.time_stage('总耗时', time.time() - total_start)
             return ctx

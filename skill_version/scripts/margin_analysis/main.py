@@ -249,7 +249,9 @@ def main():
 
     # ---- 写出 JSON ----
     json_path = Path(output_dir) / "margin_analysis.json"
-    json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    # 保留 summary 顶层便于直接读取，同时兼容 HTML 模板的 .summary 访问
+    wrapper = {"summary": summary, "records_count": len(result.get("records", []))}
+    json_path.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2), encoding='utf-8')
 
     # ---- 写出 CSV ----
     csv_path = Path(output_dir) / "margin_analysis.csv"

@@ -69,6 +69,6 @@
    - 全部 true → 恭喜用户。
    - 某几项 false → 按上面的话术解释具体是哪里的问题。
 4. 常见的根因消息：
-   - `ValueError: 列和超过 1` → 超领，检查 BOM 领用数量。
    - `ValueError: 存在自环` → 工单领了自己，检查 BOM 材料编码。
    - 如果 validation 里每项都写着 `"detail": "矩阵构建阶段失败"` → 别纠结这些字段了，直接看 `error_message`。
+   - 如果 `force_normalized` 为 true → 系统已自动处理超领，不影响结果。告诉用户有 `force_normalized_count` 个物料被归一化即可。
