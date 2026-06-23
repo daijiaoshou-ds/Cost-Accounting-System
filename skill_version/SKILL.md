@@ -96,8 +96,8 @@ python scripts/check_env.py --json
 | 看到什么 | 你该做什么 |
 |---------|-----------|
 | Python < 3.10 | 帮用户装 Python 3.10+。Windows: `winget install Python.Python.3.13` |
-| 缺 pip 包 | 直接跑 `pip install -r requirements.txt` |
-| 完全空白环境 | 装 Python → 建 venv → pip install，一条龙 |
+| 缺 pip 包 | 直接跑 `pip install -r requirements.txt`。国内网络慢就用清华镜像：`pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple` |
+| 完全空白环境 | 装 Python → 建 venv → pip install（国内用 `-i https://pypi.tuna.tsinghua.edu.cn/simple`），一条龙 |
 | 缺 fastexcel | 不碍事，openpyxl 能兜底。可以顺手装上 |
 
 ### 最后验证

@@ -85,6 +85,27 @@ smart_match 使用正则权重匹配，可能误匹配。
 
 ---
 
+## 环境安装问题
+
+### pip 安装速度慢
+国内网络访问 PyPI 官方源较慢。
+
+**解决**：
+使用清华镜像源：
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 依赖冲突
+某些包版本冲突导致安装失败。
+
+**解决**：
+```bash
+pip install -r requirements.txt --upgrade
+```
+
+---
+
 ## 性能问题
 
 ### 计算耗时过长
