@@ -440,6 +440,18 @@ class CostPipeline:
                 ctx.log.error(f"{year}年{month}月 矩阵求解失败: {e}")
                 continue
 
+            # 超级成本还原：将 X 拆解到原始成本维度（期初/采购/工费）
+            try:
+                sr = calc.super_restore(
+                    top_products=None,  # 还原全部产品
+                    force_calculate=ctx.options.get('force_calculate', False),
+                )
+                calc.result.update(sr)
+                ctx.log.metric(f'stage4_{year}Y{month:02d}M_超级还原维度',
+                               calc.performance_log.get('超级还原维度数', 0))
+            except Exception as e:
+                ctx.log.warn(f"{year}年{month}月 超级还原失败: {e}")
+
             ctx.monthly_calc[(year, month)] = calc
             ctx.monthly_X[(year, month)] = calc.X_total
 

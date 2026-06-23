@@ -170,6 +170,12 @@ python scripts/cost_calculation/pipeline_cli.py --config config.json --dry-run
 
 ## Phase 3: 一键跑起来
 
+### 跑之前先告知用户
+
+> 超级成本还原默认对**全部产品**做期初/采购/工费维度拆解，矩阵越大耗时越长。
+> 参考：100 个物料约 10s，1000 个物料约 1-2 分钟，万级物料约 5-10 分钟。
+> 跑之前跟用户说一声预计等多久，别让用户干等。
+
 ```bash
 python scripts/run_all.py --config config.json --output-dir ./output
 ```
@@ -180,7 +186,8 @@ python scripts/run_all.py --config config.json --output-dir ./output
 Step 0: 环境检查
 Step 1: 核心核算
          S1 字段校验 → S2 数据清洗 → S3 W/D矩阵校验（强制计算默认开启，超领自动归一化）
-         → S4 矩阵求解 → S5 出 CSV
+         → S4 矩阵求解 + 超级成本还原（期初/采购/工费维度自动拆解）
+         → S5 出 CSV
 Step 2: 成本波动分析 (Step 1 成了才跑)
 Step 3: 毛利率分析   (Step 1 成了才跑)
 Step 4: HTML 报告    (Step 2+3 成了才跑)
@@ -252,8 +259,10 @@ Step 4: HTML 报告    (Step 2+3 成了才跑)
 |-----------|------------|
 | "这个产品成本为什么波动？" | `output/{month}/工单明细.csv` |
 | "这个批次毛利为什么低？" | `output/{month}/收发存汇总.csv` |
+| "成本来源是什么？期初/采购/工费各占多少？" | `output/{month}/超级还原_完工成本.csv` |
 | "BOM 结构是什么样的？" | `output/{month}/工单产品材料明细.csv` |
 | "每个节点的成本多少？" | `output/{month}/成本明细.csv` |
+| "超级还原算得对不对？" | `output/{month}/超级还原_验证差异.csv` |
 
 ---
 
@@ -264,6 +273,7 @@ Step 4: HTML 报告    (Step 2+3 成了才跑)
 - **用户问成本波动** → 路径 A：读波动 JSON + 工单明细 CSV，追维度变化
 - **用户问毛利率异常** → 路径 B：读毛利率 JSON + 销售成本 CSV，查收入/成本构成
 - **用户问整体趋势** → 路径 C：跨月对比波动排名 + 毛利率变化
+- **用户问成本来源** → 路径 D：读超级还原 CSV，追期初/采购/工费占比
 
 按路径一步步查数据，最后用中文回复用户：波动多少、什么原因、有什么建议。
 
@@ -296,6 +306,10 @@ Step 4: HTML 报告    (Step 2+3 成了才跑)
 | `output/margin_analysis.csv` | 用户要明细 | 按需读 |
 | `output/cost_report.html` | Phase 5 | 让用户浏览器打开 |
 | `output/{month}/*.csv` | Phase 6 深入追踪 | 按需读 |
+| `output/{month}/超级还原_完工成本.csv` | 用户问成本来源 | 按需读 |
+| `output/{month}/超级还原_TopN汇总.csv` | 用户问Top产品 | 按需读 |
+| `output/{month}/超级还原_维度定义.csv` | 用户问维度 | 按需读 |
+| `output/{month}/超级还原_验证差异.csv` | 用户怀疑算错 | 按需读 |
 
 ## 参考文档速查
 
